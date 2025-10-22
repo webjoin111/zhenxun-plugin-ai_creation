@@ -4,10 +4,10 @@ import hashlib
 from typing import Any
 
 import aiofiles
-import aiohttp
 
 from zhenxun.configs.path_config import TEMP_PATH
 from zhenxun.services.log import logger
+from zhenxun.utils.http_utils import AsyncHttpx
 
 IMAGE_DIR = TEMP_PATH / "ai_creation"
 IMAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -17,26 +17,7 @@ class ImageDownloader:
     """AI生成图片下载器"""
 
     def __init__(self):
-        self.session: aiohttp.ClientSession | None = None
         self.downloaded_images: list[dict[str, Any]] = []
-
-    async def __aenter__(self):
-        """异步上下文管理器入口"""
-        self.session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=30),
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                    "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-                )
-            },
-        )
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """异步上下文管理器退出"""
-        if self.session:
-            await self.session.close()
 
     def _generate_filename(
         self, image_info: dict[str, Any], provider: str = "ai_generated"
@@ -69,141 +50,68 @@ class ImageDownloader:
         image_info: dict[str, Any],
         prompt: str = "",
         provider: str = "ai_generated",
-        max_retries: int = 3,
-        retry_delay: float = 2.0,
     ) -> dict[str, Any] | None:
-        """下载单张图片（带重试机制）"""
-        if not self.session:
-            logger.error("HTTP会话未初始化")
-            return None
-
+        """下载单张图片"""
         url = image_info["url"]
+        logger.info(f"开始下载AI生成图片: {url[:100]}...")
 
-        for attempt in range(max_retries + 1):
-            try:
-                if attempt > 0:
-                    logger.info(
-                        f"重试下载图片 (第{attempt}/{max_retries}次): {url[:100]}..."
-                    )
-                    await asyncio.sleep(retry_delay * attempt)
-                else:
-                    logger.info(f"开始下载AI生成图片: {url[:100]}...")
+        headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+            ),
+            "Referer": "https://www.doubao.com/",
+            "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
+            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Cache-Control": "no-cache",
+            "Pragma": "no-cache",
+        }
 
-                headers = {
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
-                    ),
-                    "Referer": "https://www.doubao.com/",
-                    "Accept": "image/webp,image/apng,image/*,*/*;q=0.8",
-                    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-                    "Cache-Control": "no-cache",
-                    "Pragma": "no-cache",
-                }
+        try:
+            image_data = await AsyncHttpx.get_content(url, headers=headers, timeout=30)
 
-                async with self.session.get(
-                    url, headers=headers, timeout=aiohttp.ClientTimeout(total=30)
-                ) as response:
-                    if response.status == 200:
-                        filename = self._generate_filename(image_info, provider)
-                        filepath = IMAGE_DIR / filename
+            if not image_data or len(image_data) < 1024:
+                logger.warning(
+                    f"下载的图片数据过小 ({len(image_data)} bytes)，可能是错误响应"
+                )
+                logger.error(f"图片数据过小，下载失败: {url}")
+                return None
 
-                        image_data = await response.read()
+            filename = self._generate_filename(image_info, provider)
+            filepath = IMAGE_DIR / filename
 
-                        if len(image_data) < 1024:
-                            logger.warning(
-                                f"下载的图片数据过小 ({len(image_data)} bytes)，"
-                                "可能是错误响应"
-                            )
-                            if attempt < max_retries:
-                                continue
-                            else:
-                                logger.error(f"图片数据过小，下载失败: {url}")
-                                return None
+            async with aiofiles.open(filepath, "wb") as f:
+                await f.write(image_data)
 
-                        async with aiofiles.open(filepath, "wb") as f:
-                            await f.write(image_data)
+            result = {
+                "url": url,
+                "local_path": str(filepath.resolve()),
+                "filename": filename,
+                "size_bytes": len(image_data),
+                "format": image_info.get("format", "png"),
+                "dimensions": image_info.get("dimensions", {}),
+                "index": image_info.get("index", 99),
+                "prompt": prompt,
+                "provider": provider,
+                "download_time": datetime.now().isoformat(),
+            }
 
-                        result = {
-                            "url": url,
-                            "local_path": str(filepath.resolve()),
-                            "filename": filename,
-                            "size_bytes": len(image_data),
-                            "format": image_info.get("format", "png"),
-                            "dimensions": image_info.get("dimensions", {}),
-                            "index": image_info.get("index", 99),
-                            "prompt": prompt,
-                            "provider": provider,
-                            "download_time": datetime.now().isoformat(),
-                            "download_attempts": attempt + 1,
-                        }
+            self.downloaded_images.append(result)
+            logger.info(f"✅ AI图片下载成功: {filename} ({len(image_data)} bytes)")
+            return result
 
-                        self.downloaded_images.append(result)
-                        logger.info(
-                            f"✅ AI图片下载成功: {filename} ({len(image_data)} bytes)"
-                            + (f" (重试{attempt}次后成功)" if attempt > 0 else "")
-                        )
-                        return result
-
-                    elif response.status == 403:
-                        logger.warning(
-                            f"图片访问被拒绝 (403)，尝试重试: {url[:100]}..."
-                        )
-                        if attempt < max_retries:
-                            continue
-                        else:
-                            logger.error(
-                                f"图片下载失败，HTTP状态码: {response.status} "
-                                f"(已重试{max_retries}次)"
-                            )
-                            return None
-                    elif response.status in [429, 502, 503, 504]:
-                        logger.warning(
-                            f"服务器临时错误 ({response.status})，"
-                            f"尝试重试: {url[:100]}..."
-                        )
-                        if attempt < max_retries:
-                            continue
-                        else:
-                            logger.error(
-                                f"图片下载失败，HTTP状态码: {response.status} "
-                                f"(已重试{max_retries}次)"
-                            )
-                            return None
-                    else:
-                        logger.error(f"图片下载失败，HTTP状态码: {response.status}")
-                        if attempt < max_retries:
-                            continue
-                        else:
-                            return None
-
-            except asyncio.TimeoutError:
-                logger.warning(f"下载图片超时 (第{attempt + 1}次尝试): {url[:100]}...")
-                if attempt < max_retries:
-                    continue
-                else:
-                    logger.error(f"图片下载超时，已重试{max_retries}次: {url}")
-                    return None
-            except Exception as e:
-                logger.warning(f"下载图片时发生错误 (第{attempt + 1}次尝试): {e}")
-                if attempt < max_retries:
-                    continue
-                else:
-                    logger.error(f"图片下载失败，已重试{max_retries}次: {e}")
-                    return None
-
-        return None
+        except Exception as e:
+            logger.error(f"图片下载失败 (URL: {url[:100]}...)，错误: {e}")
+            return None
 
     async def download_images(
         self,
         image_infos: list[dict[str, Any]],
         prompt: str = "",
         provider: str = "ai_generated",
-        max_retries: int = 3,
-        retry_delay: float = 2.0,
         min_success_count: int = 1,
     ) -> list[dict[str, Any]]:
-        """批量下载图片（带重试和最小成功数量保证）"""
+        """批量下载图片（带最小成功数量保证）"""
         results = []
         failed_urls = []
 
@@ -217,7 +125,7 @@ class ImageDownloader:
             if "index" not in info:
                 info["index"] = i
 
-            task = self.download_image(info, prompt, provider, max_retries, retry_delay)
+            task = self.download_image(info, prompt, provider)
             tasks.append(task)
 
         download_results = await asyncio.gather(*tasks)
@@ -264,11 +172,10 @@ class ImageDownloader:
                 if "message" in data and isinstance(data["message"], dict):
                     data = data["message"]
                 if "content" in data and isinstance(data["content"], str):
-                    # 增加对无效JSON的容错
                     try:
                         data = json.loads(data["content"])
                     except (json.JSONDecodeError, TypeError):
-                        return []  # 如果content不是有效JSON，直接返回
+                        return []
             except (json.JSONDecodeError, TypeError):
                 return []
 
@@ -290,7 +197,6 @@ class ImageDownloader:
                     continue
 
                 url = None
-                # 优先选择更高质量的图片版本
                 priority_keys = ["image_raw", "image_ori", "preview_img", "image_thumb"]
                 for key in priority_keys:
                     if img_data := image_info.get(key, {}):
