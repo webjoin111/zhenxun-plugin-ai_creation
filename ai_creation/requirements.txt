@@ -1,1 +1,2 @@
 playwright-stealth
+tomli_w
