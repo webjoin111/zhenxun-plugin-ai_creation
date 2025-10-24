@@ -88,7 +88,7 @@ draw [附带图片] -o on 换成赛博朋克风格
     supported_adapters={"~onebot.v11"},
     extra=PluginExtraData(
         author="webjoin111",
-        version="1.0.0",
+        version="1.1.0",
         configs=[
             RegisterConfig(
                 module="ai_creation",
@@ -144,8 +144,14 @@ draw [附带图片] -o on 换成赛博朋克风格
             RegisterConfig(
                 module="ai_creation",
                 key="browser_cooldown_seconds",
-                value=60,
+                value=15,
                 help="浏览器关闭后的冷却时间（秒），冷却期间不接受新绘图请求",
+            ),
+            RegisterConfig(
+                module="ai_creation",
+                key="doubao_wait_signal_timeout",
+                value=120,
+                help="豆包引擎等待图片生成完成信号的超时时间（秒）",
             ),
             RegisterConfig(
                 module="ai_creation",
@@ -154,7 +160,7 @@ draw [附带图片] -o on 换成赛博朋克风格
                 help="AI绘图功能的冷却时间（秒）",
             ),
         ],
-    ).dict()
+    ).dict(),
 )
 
 draw_alconna = Alconna(
@@ -226,7 +232,7 @@ dtemplate_superuser_alc = Alconna(
     ),
     Subcommand(
         "optimize",
-         Args["name", str]["instruction", AllParam, ""],
+        Args["name", str]["instruction", AllParam, ""],
         alias=["优化"],
         help_text="优化一个已有的模板",
     ),
@@ -288,17 +294,17 @@ driver = get_driver()
 @driver.on_startup
 async def _():
     logger.info("AI Draw Plugin: 正在初始化...")
+    from .engines.doubao.queue_manager import draw_queue_manager
+    from .engines.doubao.cookie_manager import cookie_manager
     from . import templates
-    from .core.cookie_manager import cookie_manager
-    from .core.queue_manager import draw_queue_manager
 
     try:
-        cookie_manager.load_cookies()
         cooldown = base_config.get("browser_cooldown_seconds")
         draw_queue_manager.set_browser_cooldown(cooldown)
+        await cookie_manager.load_and_sync_cookies()
         draw_queue_manager.start_queue_processor()
         await templates.template_manager.initialize()
-        logger.info(f"绘图队列处理器已启动, 浏览器冷却时间: {cooldown}s")
+        logger.info(f"AI Draw 插件核心服务已启动, 浏览器冷却时间: {cooldown}s")
     except Exception as e:
         logger.error(f"AI Draw 插件初始化失败: {e}")
 
@@ -306,10 +312,10 @@ async def _():
 @driver.on_shutdown
 async def ai_draw_shutdown():
     logger.info("AI Draw Plugin: 正在关闭...")
-    from .core.queue_manager import draw_queue_manager
+    from .engines.doubao.queue_manager import draw_queue_manager
 
     await draw_queue_manager.stop_queue_processor()
-    logger.info("绘图队列处理器已停止")
+    await draw_queue_manager.shutdown_browser()
 
 
 from . import handlers  # noqa: E402, F401

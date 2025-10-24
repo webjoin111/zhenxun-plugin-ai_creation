@@ -7,6 +7,9 @@ from typing import Any
 
 from zhenxun.services.log import logger
 
+from ...config import base_config
+from .generator import DoubaoImageGenerator, ImageGenerationError
+
 
 class RequestStatus(Enum):
     """请求状态枚举"""
@@ -67,6 +70,7 @@ class DrawQueueManager:
         self._processing_request: DrawRequest | None = None
         self._completed_requests: list[DrawRequest] = []
         self._lock = asyncio.Lock()
+        self.image_generator = DoubaoImageGenerator()
         self._processing_lock = asyncio.Lock()
 
         self._total_requests = 0
@@ -79,15 +83,27 @@ class DrawQueueManager:
 
         logger.info("AI绘图队列管理器已初始化")
 
+    async def initialize_browser(self):
+        """初始化常驻浏览器实例"""
+        logger.info("正在初始化常驻浏览器...")
+        await self.image_generator.initialize()
+
+    async def shutdown_browser(self):
+        """关闭常驻浏览器实例"""
+        logger.info("正在关闭常驻浏览器...")
+        await self.image_generator.cleanup()
+
     def set_browser_cooldown(self, seconds: int):
         """设置浏览器冷却时间"""
         self._browser_cooldown_seconds = seconds
         logger.info(f"浏览器冷却时间已设置为 {seconds} 秒")
 
     def set_browser_close_time(self):
-        """记录浏览器关闭时间"""
+        """记录任务完成时间，并启动浏览器冷却期"""
         self._last_browser_close_time = datetime.now()
-        logger.info("浏览器关闭时间已记录，开始冷却期")
+        logger.info(
+            f"任务处理完成，浏览器进入冷却期 ({self._browser_cooldown_seconds}秒)..."
+        )
 
     def is_browser_in_cooldown(self) -> bool:
         """检查浏览器是否在冷却期"""
@@ -182,9 +198,15 @@ class DrawQueueManager:
             self._completed_requests.append(request)
             self._processing_request = None
 
+            if request.cookie:
+                from .cookie_manager import cookie_manager
+
+                await cookie_manager.increment_usage(request.cookie)
+
             logger.info(
                 f"请求 {request.request_id} 处理完成，耗时: {processing_time:.1f}秒"
             )
+            self.set_browser_close_time()
 
     async def fail_request(self, request: DrawRequest, error: str):
         """标记请求失败"""
@@ -197,6 +219,7 @@ class DrawQueueManager:
             self._processing_request = None
 
             logger.error(f"请求 {request.request_id} 处理失败: {error}")
+            self.set_browser_close_time()
 
     async def cancel_request(self, request_id: str) -> bool:
         """取消请求"""
@@ -291,42 +314,56 @@ class DrawQueueManager:
                 )
                 await asyncio.sleep(min(5, cooldown_remaining))
 
+            if not self.image_generator.is_initialized:
+                logger.warning("检测到浏览器未初始化，正在尝试启动...")
+                await self.initialize_browser()
+                if not self.image_generator.is_initialized:
+                    logger.error("浏览器启动失败，无法处理任务。")
+                    async with self._lock:
+                        for req in self._queue:
+                            req.status = RequestStatus.FAILED
+                            req.error = "浏览器未能成功初始化，无法执行任务。"
+                            self._completed_requests.append(req)
+                        self._queue.clear()
+                    return None
+
             current_request = await self.get_next_request()
             if not current_request:
                 return None
 
-            from ..config import base_config
-            from ..engine import image_generator
-
             try:
-                selected_cookie = None
                 if base_config.get("ENABLE_DOUBAO_COOKIES"):
                     from .cookie_manager import cookie_manager
 
-                    selected_cookie = cookie_manager.get_next_cookie()
+                    selected_cookie = await cookie_manager.get_next_cookie()
                     if not selected_cookie:
-                        raise RuntimeError("当前无可用Cookie，请稍后再试或检查配置。")
+                        raise RuntimeError("今日AI绘图额度已用尽，请明日再试。")
+                    current_request.cookie = selected_cookie
+                    await self.image_generator.update_session_cookie(selected_cookie)
 
-                current_request.cookie = selected_cookie
-
-                await image_generator.initialize(cookie=selected_cookie)
-
-                result = await image_generator.generate_image(
+                result = await self.image_generator.generate_image(
                     prompt=current_request.prompt,
                     count=1,
                     image_paths=current_request.image_paths,
                 )
-                await self.complete_request(current_request, result)
 
-            except Exception as e:
-                if current_request.cookie:
-                    from .cookie_manager import cookie_manager
+                if result.get("success"):
+                    await self.complete_request(current_request, result)
+                else:
+                    error_msg = result.get("error", "未知生成错误")
+                    await self.fail_request(current_request, error_msg)
 
-                    cookie_manager.report_failure(current_request.cookie)
+            except (ImageGenerationError, RuntimeError) as e:
+                logger.error(f"图片生成发生可恢复错误: {e}")
+                logger.error("发生RuntimeError，将关闭浏览器实例以待下次自愈...")
+                await self.shutdown_browser()
                 await self.fail_request(current_request, str(e))
-                raise
-            finally:
-                await image_generator.cleanup()
+            except Exception as e:
+                await self.fail_request(current_request, str(e))
+                logger.error(
+                    "发生严重未知错误，将关闭浏览器实例以待下次重启..."
+                )
+                await self.shutdown_browser()
 
             return current_request
 

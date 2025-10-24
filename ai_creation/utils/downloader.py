@@ -157,68 +157,7 @@ class ImageDownloader:
 
         return results
 
-    def parse_doubao_image_data(self, image_data_str: str) -> list[dict[str, Any]]:
-        """解析豆包图片数据字符串，提取图片URL和其在creations数组中的原始索引。"""
-        if not image_data_str or not image_data_str.strip():
-            return []
-
-        try:
-            import json
-
-            try:
-                data = json.loads(image_data_str)
-                if "event_data" in data and isinstance(data["event_data"], str):
-                    data = json.loads(data["event_data"])
-                if "message" in data and isinstance(data["message"], dict):
-                    data = data["message"]
-                if "content" in data and isinstance(data["content"], str):
-                    try:
-                        data = json.loads(data["content"])
-                    except (json.JSONDecodeError, TypeError):
-                        return []
-            except (json.JSONDecodeError, TypeError):
-                return []
-
-            creations = data.get("creations", [])
-            if not isinstance(creations, list):
-                return []
-
-            images = []
-            for i, creation in enumerate(creations):
-                if not isinstance(creation, dict) or creation.get("type") != 1:
-                    continue
-
-                image_info = creation.get("image", {})
-                if not isinstance(image_info, dict):
-                    continue
-
-                image_key = image_info.get("key")
-                if not image_key:
-                    continue
-
-                url = None
-                priority_keys = ["image_raw", "image_ori", "preview_img", "image_thumb"]
-                for key in priority_keys:
-                    if img_data := image_info.get(key, {}):
-                        if found_url := img_data.get("url"):
-                            url = found_url
-                            logger.debug(
-                                f"成功从字段 '{key}' 获取图片URL, "
-                                "已选定最高优先级版本。"
-                            )
-                            break
-
-                if url:
-                    images.append({"url": url, "index": i, "key": image_key})
-
-            return images
-
-        except Exception as e:
-            logger.error(f"处理豆包图片数据时发生未知错误: {e}", e=e)
-
-        return []
-
-    def _get_format_from_url(self, url: str) -> str:
+    def _get_format_from_url(self, url: str) -> str:  # noqa: E501
         """从URL获取图片格式"""
         if ".jpeg" in url or ".jpg" in url:
             return "jpeg"

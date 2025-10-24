@@ -1,4 +1,3 @@
-from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
 import tempfile
@@ -7,52 +6,11 @@ from typing import Any
 import aiofiles
 from PIL import Image
 
-from zhenxun.services.llm import create_image
 from zhenxun.services.log import logger
 
-from ..config import base_config
+from ...utils.downloader import IMAGE_DIR
+from .. import DrawEngine
 from .queue_manager import draw_queue_manager
-from ..engine.downloader import IMAGE_DIR
-
-
-class DrawEngine(ABC):
-    """绘图引擎的抽象基类"""
-
-    @abstractmethod
-    async def draw(
-        self, prompt: str, image_bytes: list[bytes] | None = None
-    ) -> dict[str, Any]:
-        """
-        执行绘图操作并返回结果。
-
-        Args:
-            prompt (str): 绘图的提示词。
-            image_bytes (list[bytes] | None): 用于图生图的原始图片字节数据列表。
-
-        Returns:
-            dict[str, Any]: A dictionary containing 'images' (list[bytes]) and optional 'text' (str).
-        """
-        pass
-
-
-class LlmApiEngine(DrawEngine):
-    """使用 zhenxun.services.llm API 的绘图引擎"""
-
-    async def draw(
-        self, prompt: str, image_bytes: list[bytes] | None = None
-    ) -> dict[str, Any]:
-        logger.info("🎨 使用 LLM API 引擎进行绘图...")
-        draw_model_name = base_config.get("api_draw_model")
-        if not draw_model_name:
-            raise ValueError("未配置API绘图模型 (api_draw_model)")
-
-        response = await create_image(
-            prompt=prompt,
-            images=image_bytes,  # type: ignore
-            model=draw_model_name,
-        )
-        images = response.images or []
-        return {"images": images, "text": response.text}
 
 
 class DoubaoEngine(DrawEngine):
@@ -61,6 +19,15 @@ class DoubaoEngine(DrawEngine):
     async def draw(
         self, prompt: str, image_bytes: list[bytes] | None = None
     ) -> dict[str, Any]:
+        prompt_str = ""
+        if isinstance(prompt, list):
+            logger.info(
+                f"Doubao引擎检测到列表型Prompt，将使用换行符连接 {len(prompt)} 个分镜。"
+            )
+            prompt_str = "\n\n".join(map(str, prompt))
+        else:
+            prompt_str = str(prompt)
+
         logger.info("🎨 使用豆包 (Playwright) 引擎进行绘图...")
         image_file_paths: list[Path] = []
         temp_files_to_clean: list[Path] = []
@@ -104,7 +71,7 @@ class DoubaoEngine(DrawEngine):
         )
 
         request = await draw_queue_manager.add_request(
-            "api_user", prompt, image_paths=image_paths_str
+            "api_user", prompt_str, image_paths=image_paths_str
         )
 
         draw_queue_manager.start_queue_processor()
@@ -137,21 +104,3 @@ class DoubaoEngine(DrawEngine):
             async with aiofiles.open(img_info["local_path"], "rb") as f:
                 results.append(await f.read())
         return {"images": results, "text": text_response}
-
-
-def get_engine(engine_name: str) -> DrawEngine:
-    """
-    绘图引擎工厂函数。
-
-    Args:
-        engine_name (str): 引擎的名称 ('doubao' 或 'api').
-
-    Returns:
-        DrawEngine: 对应的引擎实例。
-    """
-    if engine_name.lower() == "doubao":
-        return DoubaoEngine()
-    elif engine_name.lower() == "api":
-        return LlmApiEngine()
-    else:
-        raise ValueError(f"未知的绘图引擎: '{engine_name}'")

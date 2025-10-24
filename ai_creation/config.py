@@ -192,3 +192,22 @@ DEFAULT_TEMPLATES = {
         "添加轻微镜头畸变或iPhone特有的HDR色调倾向。"
     ),
 }
+
+DOUBAO_SELECTORS = {
+    "file_upload": [
+        'input[type="file"]',
+        'input[accept*="image"]',
+        'input[accept*="image/*"]',
+    ],
+    "prompt_input": [
+        "[contenteditable='true']",
+        "textarea",
+        "input[type='text']",
+        'textarea[placeholder*="描述"]',
+        'textarea[placeholder*="输入"]',
+        'input[placeholder*="描述"]',
+        'input[placeholder*="输入"]',
+        ".input-area textarea",
+        ".prompt-input",
+    ],
+}
