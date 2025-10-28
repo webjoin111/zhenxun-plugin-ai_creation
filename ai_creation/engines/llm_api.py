@@ -13,7 +13,7 @@ class LlmApiEngine(DrawEngine):
     async def draw(
         self, prompt: str, image_bytes: list[bytes] | None = None
     ) -> dict[str, Any]:
-        logger.info("🎨 使用 LLM API 引擎进行绘图...")
+        logger.debug("🎨 使用 LLM API 引擎进行绘图...")
         draw_model_name = base_config.get("api_draw_model")
         if not draw_model_name:
             raise ValueError("未配置API绘图模型 (api_draw_model)")

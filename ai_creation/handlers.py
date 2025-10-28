@@ -49,6 +49,7 @@ async def draw_handler(
             bot=bot,
             event=event,
             matcher=cmd,
+            engine=base_config.get("engine"),
             command_result=result,
             user_id=event.get_user_id(),
             initial_options=initial_options,

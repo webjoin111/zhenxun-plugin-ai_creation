@@ -8,7 +8,7 @@ class DrawEngine(ABC):
     @abstractmethod
     async def draw(
         self, prompt: str, image_bytes: list[bytes] | None = None
-    ) -> dict[str, Any]:
+    ) -> dict[str, Any] | list[dict[str, Any]]:
         """
         执行绘图操作并返回结果。
         """

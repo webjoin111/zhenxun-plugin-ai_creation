@@ -53,7 +53,7 @@ class ImageDownloader:
     ) -> dict[str, Any] | None:
         """下载单张图片"""
         url = image_info["url"]
-        logger.info(f"开始下载AI生成图片: {url[:100]}...")
+        logger.debug(f"开始下载AI生成图片: {url[:100]}...")
 
         headers = {
             "User-Agent": (
@@ -97,7 +97,7 @@ class ImageDownloader:
             }
 
             self.downloaded_images.append(result)
-            logger.info(f"✅ AI图片下载成功: {filename} ({len(image_data)} bytes)")
+            logger.debug(f"✅ AI图片下载成功: {filename} ({len(image_data)} bytes)")
             return result
 
         except Exception as e:
@@ -115,7 +115,7 @@ class ImageDownloader:
         results = []
         failed_urls = []
 
-        logger.info(f"开始批量下载 {len(image_infos)} 张图片...")
+        logger.debug(f"开始批量下载 {len(image_infos)} 张图片...")
 
         tasks = []
         for i, info in enumerate(image_infos):
@@ -146,7 +146,7 @@ class ImageDownloader:
         success_count = len(results)
         total_count = len(image_infos)
 
-        logger.info(f"批量下载完成，成功下载 {success_count}/{total_count} 张图片")
+        logger.debug(f"批量下载完成，成功下载 {success_count}/{total_count} 张图片")
 
         if success_count < min_success_count:
             logger.warning(

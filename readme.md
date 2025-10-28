@@ -74,6 +74,15 @@
 
 </td>
 </tr>
+<tr>
+<td colspan="2">
+
+### 🤖 验证码处理
+- 自动识别并解决豆包AI绘图的拖拽验证码
+- 无需人工干预，提升自动化体验
+
+</td>
+</tr>
 </table>
 
 ---
@@ -390,7 +399,8 @@ draw [附带图片] -o on 换成赛博朋克风格
 <td>
 • 修改描述，避免敏感词<br>
 • 设置 <code>HEADLESS_BROWSER=False</code> 手动验证<br>
-• 重新获取 Cookie
+• 重新获取 Cookie<br>
+• 启用 <code>DOUBAO_AUTO_SOLVE_CAPTCHA</code> 配置项自动处理验证码
 </td>
 </tr>
 <tr>
@@ -431,6 +441,12 @@ draw [附带图片] -o on 换成赛博朋克风格
 | `default_draw_engine` | `"doubao"` | 默认绘图引擎：`doubao` / `api` |
 | `enable_api_draw_engine` | `True` | 是否允许非管理员使用 API 引擎 |
 | `api_draw_model` | `"Gemini/gemini-2.5-flash-image-preview"` | API 引擎使用的模型 |
+
+### 🤖 验证码处理配置
+
+| 配置项 | 默认值 | 说明 |
+| :--- | :---: | :--- |
+| `DOUBAO_AUTO_SOLVE_CAPTCHA` | `True` | 是否在豆包绘图时启用AI自动解决拖拽验证码。关闭后，遇到验证码将导致绘图失败。 |
 
 ### ✨ 提示词优化配置
 

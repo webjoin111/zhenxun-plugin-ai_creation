@@ -10,7 +10,7 @@ from zhenxun.services.log import logger
 
 from ...utils.downloader import IMAGE_DIR
 from .. import DrawEngine
-from .queue_manager import draw_queue_manager
+from .queue_manager import RequestStatus, draw_queue_manager
 
 
 class DoubaoEngine(DrawEngine):
@@ -18,17 +18,17 @@ class DoubaoEngine(DrawEngine):
 
     async def draw(
         self, prompt: str, image_bytes: list[bytes] | None = None
-    ) -> dict[str, Any]:
+    ) -> list[dict[str, Any]]:
         prompt_str = ""
         if isinstance(prompt, list):
-            logger.info(
+            logger.debug(
                 f"Doubao引擎检测到列表型Prompt，将使用换行符连接 {len(prompt)} 个分镜。"
             )
             prompt_str = "\n\n".join(map(str, prompt))
         else:
             prompt_str = str(prompt)
 
-        logger.info("🎨 使用豆包 (Playwright) 引擎进行绘图...")
+        logger.debug("🎨 使用豆包 (Playwright) 引擎进行绘图...")
         image_file_paths: list[Path] = []
         temp_files_to_clean: list[Path] = []
         if image_bytes:
@@ -39,7 +39,7 @@ class DoubaoEngine(DrawEngine):
                 try:
                     with Image.open(BytesIO(img_bytes)) as img:
                         if getattr(img, "is_animated", False):
-                            logger.info(
+                            logger.debug(
                                 f"检测到第 {i + 1} 张图片为GIF，将提取第一帧并转换为PNG进行图生图。"
                             )
                             img.seek(0)
@@ -58,7 +58,7 @@ class DoubaoEngine(DrawEngine):
                         temp_file_path = Path(temp_file.name)
                         image_file_paths.append(temp_file_path)
                         temp_files_to_clean.append(temp_file_path)
-                    logger.info(
+                    logger.debug(
                         f"图生图的第 {i + 1} 张输入图片已处理并保存为PNG: {temp_file_path}"
                     )
                 except Exception as e:
@@ -87,20 +87,23 @@ class DoubaoEngine(DrawEngine):
         if not completed_request:
             raise RuntimeError("请求处理超时")
 
-        result_data = completed_request.result or {}
-        if not result_data.get("success"):
-            error_msg = completed_request.error or (
-                result_data.get("error", "未知错误")
-            )
+        if (
+            completed_request.status != RequestStatus.COMPLETED
+            or not completed_request.result
+        ):
+            error_msg = completed_request.error or "未知错误"
             raise RuntimeError(f"图片生成失败: {error_msg}")
 
-        images_info = result_data.get("images", [])
-        text_response = result_data.get("text", "")
-        if not images_info and not text_response:
-            raise RuntimeError("图片生成失败：未获取到图片或文本数据")
+        structured_result = completed_request.result.get("structured_result", [])
+        if not structured_result:
+            raise RuntimeError("图片生成失败：未获取到任何内容")
 
-        results = []
-        for img_info in images_info:
-            async with aiofiles.open(img_info["local_path"], "rb") as f:
-                results.append(await f.read())
-        return {"images": results, "text": text_response}
+        for block in structured_result:
+            if block["type"] == "image":
+                image_bytes_list = []
+                for img_info in block.get("content", []):
+                    async with aiofiles.open(img_info["local_path"], "rb") as f:
+                        image_bytes_list.append(await f.read())
+                block["content"] = image_bytes_list
+
+        return structured_result

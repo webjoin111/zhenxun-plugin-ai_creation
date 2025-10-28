@@ -88,7 +88,7 @@ draw [附带图片] -o on 换成赛博朋克风格
     supported_adapters={"~onebot.v11"},
     extra=PluginExtraData(
         author="webjoin111",
-        version="1.1.0",
+        version="1.2.0",
         configs=[
             RegisterConfig(
                 module="ai_creation",
@@ -140,6 +140,12 @@ draw [附带图片] -o on 换成赛博朋克风格
                 key="HEADLESS_BROWSER",
                 value=True,
                 help="是否使用无头浏览器模式进行AI绘图。True为后台运行（服务器推荐），False会弹出浏览器窗口（便于本地调试）。",
+            ),
+            RegisterConfig(
+                module="ai_creation",
+                key="DOUBAO_AUTO_SOLVE_CAPTCHA",
+                value=True,
+                help="是否在豆包绘图时启用AI自动解决拖拽验证码。关闭后，遇到验证码将导致绘图失败。",
             ),
             RegisterConfig(
                 module="ai_creation",
@@ -293,7 +299,7 @@ driver = get_driver()
 
 @driver.on_startup
 async def _():
-    logger.info("AI Draw Plugin: 正在初始化...")
+    logger.debug("AI Draw Plugin: 正在初始化...")
     from .engines.doubao.queue_manager import draw_queue_manager
     from .engines.doubao.cookie_manager import cookie_manager
     from . import templates
@@ -304,14 +310,14 @@ async def _():
         await cookie_manager.load_and_sync_cookies()
         draw_queue_manager.start_queue_processor()
         await templates.template_manager.initialize()
-        logger.info(f"AI Draw 插件核心服务已启动, 浏览器冷却时间: {cooldown}s")
+        logger.debug(f"AI Draw 插件核心服务已启动, 浏览器冷却时间: {cooldown}s")
     except Exception as e:
         logger.error(f"AI Draw 插件初始化失败: {e}")
 
 
 @driver.on_shutdown
 async def ai_draw_shutdown():
-    logger.info("AI Draw Plugin: 正在关闭...")
+    logger.debug("AI Draw Plugin: 正在关闭...")
     from .engines.doubao.queue_manager import draw_queue_manager
 
     await draw_queue_manager.stop_queue_processor()

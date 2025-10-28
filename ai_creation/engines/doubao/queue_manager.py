@@ -70,6 +70,7 @@ class DrawQueueManager:
         self._processing_request: DrawRequest | None = None
         self._completed_requests: list[DrawRequest] = []
         self._lock = asyncio.Lock()
+        self._guest_usage_count = 0
         self.image_generator = DoubaoImageGenerator()
         self._processing_lock = asyncio.Lock()
 
@@ -81,22 +82,23 @@ class DrawQueueManager:
         self._queue_processor_task: asyncio.Task | None = None
         self._shutdown = False
 
-        logger.info("AI绘图队列管理器已初始化")
+        logger.debug("AI绘图队列管理器已初始化")
 
     async def initialize_browser(self):
         """初始化常驻浏览器实例"""
-        logger.info("正在初始化常驻浏览器...")
+        logger.debug("正在初始化常驻浏览器...")
         await self.image_generator.initialize()
 
     async def shutdown_browser(self):
         """关闭常驻浏览器实例"""
-        logger.info("正在关闭常驻浏览器...")
+        logger.debug("正在关闭常驻浏览器...")
+        self._guest_usage_count = 0
         await self.image_generator.cleanup()
 
     def set_browser_cooldown(self, seconds: int):
         """设置浏览器冷却时间"""
         self._browser_cooldown_seconds = seconds
-        logger.info(f"浏览器冷却时间已设置为 {seconds} 秒")
+        logger.debug(f"浏览器冷却时间已设置为 {seconds} 秒")
 
     def set_browser_close_time(self):
         """记录任务完成时间，并启动浏览器冷却期"""
@@ -160,7 +162,7 @@ class DrawQueueManager:
 
             actual_position = len(self._queue)
 
-            logger.info(
+            logger.debug(
                 f"用户 {user_id} 的绘图请求已加入队列，位置: {actual_position}, "
                 f"预估等待: {estimated_wait:.1f}秒"
             )
@@ -179,7 +181,7 @@ class DrawQueueManager:
             request.started_at = datetime.now()
             self._processing_request = request
 
-            logger.info(f"开始处理请求 {request.request_id}")
+            logger.debug(f"开始处理请求 {request.request_id}")
             return request
 
     async def complete_request(self, request: DrawRequest, result: dict[str, Any]):
@@ -203,7 +205,7 @@ class DrawQueueManager:
 
                 await cookie_manager.increment_usage(request.cookie)
 
-            logger.info(
+            logger.debug(
                 f"请求 {request.request_id} 处理完成，耗时: {processing_time:.1f}秒"
             )
             self.set_browser_close_time()
@@ -229,7 +231,7 @@ class DrawQueueManager:
                     request.status = RequestStatus.CANCELLED
                     self._queue.pop(i)
                     self._completed_requests.append(request)
-                    logger.info(f"请求 {request_id} 已取消")
+                    logger.debug(f"请求 {request_id} 已取消")
                     return True
 
             if (
@@ -329,7 +331,7 @@ class DrawQueueManager:
 
             current_request = await self.get_next_request()
             if not current_request:
-                return None
+                return
 
             try:
                 if base_config.get("ENABLE_DOUBAO_COOKIES"):
@@ -348,7 +350,18 @@ class DrawQueueManager:
                 )
 
                 if result.get("success"):
+                    is_guest_draw = not current_request.cookie
+                    if is_guest_draw:
+                        self._guest_usage_count += 1
+                        logger.info(
+                            f"无Cookie模式使用次数: {self._guest_usage_count}/5"
+                        )
+
                     await self.complete_request(current_request, result)
+
+                    if is_guest_draw and self._guest_usage_count >= 5:
+                        logger.info("无Cookie模式已达5次上限，将在本次任务完成后立即关闭浏览器。")
+                        await self.shutdown_browser()
                 else:
                     error_msg = result.get("error", "未知生成错误")
                     await self.fail_request(current_request, error_msg)
@@ -360,9 +373,7 @@ class DrawQueueManager:
                 await self.fail_request(current_request, str(e))
             except Exception as e:
                 await self.fail_request(current_request, str(e))
-                logger.error(
-                    "发生严重未知错误，将关闭浏览器实例以待下次重启..."
-                )
+                logger.error("发生严重未知错误，将关闭浏览器实例以待下次重启...")
                 await self.shutdown_browser()
 
             return current_request
@@ -381,7 +392,7 @@ class DrawQueueManager:
 
             cleaned_count = original_count - len(self._completed_requests)
             if cleaned_count > 0:
-                logger.info(f"清理了 {cleaned_count} 个旧的请求记录")
+                logger.debug(f"清理了 {cleaned_count} 个旧的请求记录")
 
     def start_queue_processor(self):
         """启动队列处理器"""
@@ -390,7 +401,7 @@ class DrawQueueManager:
             self._queue_processor_task = asyncio.create_task(
                 self._queue_processor_loop()
             )
-            logger.info("队列处理器已启动")
+            logger.debug("队列处理器已启动")
 
     async def stop_queue_processor(self):
         """停止队列处理器"""
@@ -401,11 +412,11 @@ class DrawQueueManager:
                 await self._queue_processor_task
             except asyncio.CancelledError:
                 pass
-            logger.info("队列处理器已停止")
+            logger.debug("队列处理器已停止")
 
     async def _queue_processor_loop(self):
         """队列处理器主循环"""
-        logger.info("队列处理器主循环已启动")
+        logger.debug("队列处理器主循环已启动")
         while not self._shutdown:
             try:
                 if self._queue:

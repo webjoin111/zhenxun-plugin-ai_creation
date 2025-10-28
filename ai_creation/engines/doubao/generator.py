@@ -5,19 +5,20 @@ import hashlib
 import json
 from typing import Any
 
-from playwright.async_api import Browser, BrowserContext, Page, async_playwright
+from playwright.async_api import (
+    Browser,
+    BrowserContext,
+    Page,
+    TimeoutError as PlaywrightTimeoutError,
+    async_playwright,
+)
 from playwright_stealth import Stealth
 
 from zhenxun.services.log import logger
 
 from ...config import DOUBAO_SELECTORS, base_config
 from ...utils.downloader import IMAGE_DIR, ImageDownloader
-
-
-class ImageGenerationError(Exception):
-    """图片生成错误"""
-
-    pass
+from .exceptions import ImageGenerationError
 
 
 class DoubaoImageGenerator:
@@ -35,7 +36,7 @@ class DoubaoImageGenerator:
 
         enable_cookies = base_config.get("ENABLE_DOUBAO_COOKIES", True)
         cookies_count = len(base_config.get("DOUBAO_COOKIES", []))
-        logger.info(
+        logger.debug(
             f"豆包图片生成器初始化。Cookie功能: {'启用' if enable_cookies else '禁用'}, "
             f"已配置Cookies数量: {cookies_count}"
         )
@@ -80,7 +81,7 @@ class DoubaoImageGenerator:
             await Stealth().apply_stealth_async(self.context)
             self.page = await self.context.new_page()
 
-            logger.info("豆包图片生成器浏览器初始化成功")
+            logger.debug("豆包图片生成器浏览器初始化成功")
             return True
 
         except Exception as e:
@@ -181,7 +182,7 @@ class DoubaoImageGenerator:
                             }
                         )
                 await self.context.add_cookies(cookies)
-                logger.info(f"浏览器会话已更新 {len(cookies)} 个Cookie。")
+                logger.debug(f"浏览器会话已更新 {len(cookies)} 个Cookie。")
 
         except Exception as e:
             logger.error(f"设置cookies失败: {e}")
@@ -193,7 +194,7 @@ class DoubaoImageGenerator:
             return False
 
         try:
-            logger.info("正在导航到豆包图片创建页面...")
+            logger.debug("正在导航到豆包图片创建页面...")
             await self.page.goto(
                 self.create_image_url, wait_until="domcontentloaded", timeout=60000
             )
@@ -201,7 +202,7 @@ class DoubaoImageGenerator:
             await asyncio.sleep(5)
 
             title = await self.page.title()
-            logger.info(f"页面标题: {title}")
+            logger.debug(f"页面标题: {title}")
 
             return True
 
@@ -215,11 +216,11 @@ class DoubaoImageGenerator:
             return False
 
         try:
-            logger.info(f"开始上传 {len(image_paths)} 张图片...")
+            logger.debug(f"开始上传 {len(image_paths)} 张图片...")
 
             success = await self._upload_file_input(image_paths)
             if success:
-                logger.info("文件输入框上传成功。")
+                logger.debug("文件输入框上传成功。")
                 return True
 
             logger.warning("图片上传失败")
@@ -257,7 +258,7 @@ class DoubaoImageGenerator:
                     )
                     if upload_element:
                         await upload_element.set_input_files(image_paths)
-                        logger.info(
+                        logger.debug(
                             f"通过文件输入框成功上传 {len(image_paths)} 张图片: {selector}"
                         )
                         await asyncio.sleep(2)
@@ -285,7 +286,7 @@ class DoubaoImageGenerator:
                         selector, timeout=3000
                     )
                     if input_element:
-                        logger.info(f"找到豆包输入框: {selector}")
+                        logger.debug(f"找到豆包输入框: {selector}")
                         break
                 except Exception:
                     logger.warning(f"等待元素 {selector} 超时或失败")
@@ -299,7 +300,7 @@ class DoubaoImageGenerator:
             await input_element.fill(prompt)
             await asyncio.sleep(1)
 
-            logger.info(f"已输入豆包提示词: {prompt[:200]}...")
+            logger.debug(f"已输入豆包提示词: {prompt[:200]}...")
             return True
 
         except Exception as e:
@@ -312,28 +313,49 @@ class DoubaoImageGenerator:
             return False
 
         try:
-            logger.info("使用回车键提交豆包生成请求")
+            logger.debug("使用回车键提交豆包生成请求")
             await self.page.keyboard.press("Enter")
 
             await asyncio.sleep(2)
-            logger.info("等待豆包图片生成...")
+            logger.debug("等待豆包图片生成...")
             return True
 
         except Exception as e:
             logger.error(f"提交生成请求失败: {e}")
             return False
 
+    async def _handle_captcha_if_present(self) -> bool:
+        """
+        检查页面是否存在验证码，如果存在且配置开启，则尝试解决。
+        """
+        if not self.page:
+            return False
+
+        if not base_config.get("DOUBAO_AUTO_SOLVE_CAPTCHA", True):
+            try:
+                captcha_container = self.page.locator("#captcha_container")
+                await captcha_container.wait_for(state="visible", timeout=5000)
+                logger.warning("检测到豆包验证码，但自动破解功能已关闭，任务失败。")
+                raise ImageGenerationError("遇到验证码，但自动破解功能已关闭。")
+            except PlaywrightTimeoutError:
+                logger.debug("未检测到验证码弹窗，且自动破解已关闭，流程继续。")
+                return False
+
+        from .captcha_solver import solve_drag_captcha_if_present
+
+        return await solve_drag_captcha_if_present(self.page)
+
     async def generate_doubao_image(
         self, prompt: str, image_paths: list[str] | None = None
-    ) -> tuple[str, list[dict[str, Any]]]:
+    ) -> list[dict[str, Any]]:
         """
         使用豆包生成图片，并返回文本和带索引的图片信息列表。
         这是一个无状态方法，所有状态都局限于本次调用。
         """
         generation_complete_event = asyncio.Event()
-        generated_text_parts: list[str] = []
-        generated_images: dict[str, Any] = {}
-        generated_image_order: list[str] = []
+        content_order: list[dict[str, Any]] = []
+        image_data_map: dict[str, list[str]] = {}
+        current_text_buffer: list[str] = []
 
         async def _local_sse_handler(response):
             try:
@@ -345,7 +367,7 @@ class DoubaoImageGenerator:
                 ):
                     return
 
-                body_bytes = await response.body()
+                body_bytes = await response.body()  # type: ignore
                 lines = body_bytes.decode("utf-8", errors="ignore").strip().split("\n")
                 for line in lines:
                     if not line.startswith("data:"):
@@ -371,52 +393,55 @@ class DoubaoImageGenerator:
 
                         if raw_text := content_json.get("text"):
                             repaired_text = self._repair_mojibake_text(raw_text)
-                            generated_text_parts.append(
+                            current_text_buffer.append(
                                 repaired_text.replace("\\n", "\n")
                             )
 
                         creations = content_json.get("creations")
-                        if not creations or not isinstance(creations, list):
-                            continue
+                        if creations and isinstance(creations, list):
+                            if current_text_buffer:
+                                content_order.append(
+                                    {
+                                        "type": "text",
+                                        "content": "".join(current_text_buffer),
+                                    }
+                                )
+                                current_text_buffer.clear()
 
-                        for creation in creations:
-                            image_info = creation.get("image")
-                            if not isinstance(image_info, dict):
-                                continue
-
-                            key = image_info.get("key")
-                            if not key:
-                                continue
-
-                            if key not in generated_image_order:
-                                generated_image_order.append(key)
-
-                            priority_keys = [
-                                "image_ori_raw",
-                                "image_ori",
-                                "image_preview",
-                                "image_thumb",
-                            ]
-                            selected_url = next(
-                                (
-                                    image_info.get(url_key, {}).get("url")
-                                    for url_key in priority_keys
-                                    if isinstance(image_info.get(url_key), dict)
-                                    and image_info.get(url_key, {}).get("url")
-                                ),
-                                None,
+                            message_id = message_data.get("id")
+                            is_placeholder = any(
+                                c.get("image", {}).get("status") == 1 for c in creations
                             )
-                            if selected_url:
-                                generated_images[key] = {
-                                    "url": selected_url,
-                                    "key": key,
-                                }
-                    except (json.JSONDecodeError, KeyError):
-                        logger.debug("跳过无法解析的SSE片段。")
+
+                            if is_placeholder and not any(
+                                block.get("id") == message_id for block in content_order
+                            ):
+                                content_order.append(
+                                    {"type": "image", "id": message_id}
+                                )
+                            else:
+                                urls = []
+                                for creation in creations:
+                                    image_info = creation.get("image", {})
+                                    url = (
+                                        image_info.get("image_ori_raw", {}).get("url")
+                                        or image_info.get("image_ori", {}).get("url")
+                                        or image_info.get("image_preview", {}).get(
+                                            "url"
+                                        )
+                                        or image_info.get("image_thumb", {}).get("url")
+                                    )
+                                    if url:
+                                        urls.append(url)
+                                if message_id and urls:
+                                    image_data_map[message_id] = urls
+
+                    except (json.JSONDecodeError, KeyError) as e:
+                        logger.debug(f"跳过无法解析的SSE片段: {e}")
                     except Exception as inner_exc:
-                        logger.debug(f"SSE事件处理出现未知错误: {inner_exc}")
+                        logger.warning(f"SSE事件处理出现未知错误: {inner_exc}")
             except Exception as exc:
-                logger.debug(f"SSE拦截器处理响应失败: {exc}")
+                logger.warning(f"SSE拦截器处理响应失败: {exc}")
 
         if self.page:
             self.page.on("response", _local_sse_handler)
@@ -426,11 +451,11 @@ class DoubaoImageGenerator:
                 raise ImageGenerationError("导航到豆包图片创建页面失败")
 
             if image_paths:
-                logger.info(f"检测到 {len(image_paths)} 张图片输入，开始上传...")
+                logger.debug(f"检测到 {len(image_paths)} 张图片输入，开始上传...")
                 if not await self._upload_images(image_paths):
                     logger.warning("图片上传失败，继续使用纯文本模式")
                 else:
-                    logger.info("图片上传成功，等待图片处理...")
+                    logger.debug("图片上传成功，等待图片处理...")
                     await asyncio.sleep(5)
 
             if not await self._input_prompt(prompt):
@@ -439,36 +464,51 @@ class DoubaoImageGenerator:
             if not await self._submit_generation():
                 raise ImageGenerationError("提交生成请求失败")
 
+            captcha_was_handled = await self._handle_captcha_if_present()
+            if captcha_was_handled:
+                logger.debug("验证码已处理，重置SSE流结束信号，等待新的生成流。")
+                generation_complete_event.clear()
+
             signal_timeout = int(base_config.get("doubao_wait_signal_timeout", 120))
             try:
                 await asyncio.wait_for(
                     generation_complete_event.wait(), timeout=signal_timeout
                 )
-                logger.info("✅ 收到豆包SSE流结束信号，额外等待以确保数据完整。")
+                logger.debug("✅ 收到豆包SSE流结束信号，额外等待以确保数据完整。")
                 await asyncio.sleep(3)
             except asyncio.TimeoutError:
                 logger.warning(
                     f"等待生成完成信号超时 ({signal_timeout}s)。将尝试使用已收到的数据。"
                 )
 
-            final_text = "".join(generated_text_parts)
-            ordered_images: list[dict[str, Any]] = []
-            if generated_image_order:
-                for index, key in enumerate(generated_image_order):
-                    image_data = generated_images.get(key)
-                    if not image_data:
-                        continue
-                    image_data["index"] = index
-                    ordered_images.append(image_data)
-                logger.info(f"最终成功解析并排序了 {len(ordered_images)} 张图片。")
-            else:
-                logger.warning("未收集到任何有效的图片信息。")
+            if current_text_buffer:
+                content_order.append(
+                    {"type": "text", "content": "".join(current_text_buffer)}
+                )
+                current_text_buffer.clear()
 
-            return final_text, ordered_images
+            structured_result = []
+            for block in content_order:
+                if block["type"] == "text":
+                    structured_result.append(block)
+                elif block["type"] == "image":
+                    image_urls = image_data_map.get(block["id"], [])
+                    if image_urls:
+                        structured_result.append(
+                            {
+                                "type": "image",
+                                "content": [
+                                    {"url": url, "index": i}
+                                    for i, url in enumerate(image_urls)
+                                ],
+                            }
+                        )
+
+            return structured_result
 
         except Exception as e:
-            logger.error(f"豆包图片生成失败: {e}")
-            raise ImageGenerationError(f"豆包图片生成失败: {e}")
+            logger.error("豆包图片生成失败", e=e)
+            raise ImageGenerationError(f"豆包图片生成失败: {e}") from e
         finally:
             if self.page:
                 self.page.remove_listener("response", _local_sse_handler)
@@ -582,7 +622,7 @@ class DoubaoImageGenerator:
                         f"图片下载失败: {download_result.get('error', '未知错误')}"
                     )
 
-            logger.info(
+            logger.debug(
                 f"✅ 批量下载完成，成功保存 "
                 f"{successful_downloads}/{len(image_infos)} 张图片"
             )
@@ -601,48 +641,52 @@ class DoubaoImageGenerator:
         """生成AI图片"""
         try:
             if image_paths:
-                logger.info(
+                logger.debug(
                     f"🎨 开始生成AI图片 (基于 {len(image_paths)} 张图片): {prompt}"
                 )
-                logger.info(f"📷 输入图片路径: {image_paths}")
+                logger.debug(f"📷 输入图片路径: {image_paths}")
             else:
-                logger.info(f"🎨 开始生成AI图片: {prompt}")
+                logger.debug(f"🎨 开始生成AI图片: {prompt}")
 
-            generated_text, image_infos = await self.generate_doubao_image(
-                prompt, image_paths
-            )
-            final_text = generated_text.strip()
-            api_type = "doubao"
+            structured_blocks = await self.generate_doubao_image(prompt, image_paths)
 
-            if not image_infos and not final_text:
-                raise ImageGenerationError("未能生成任何图片或有效文本")
+            if not structured_blocks:
+                raise ImageGenerationError("未能生成任何内容")
 
-            downloaded_images: list[dict[str, Any]] = []
-            if image_infos:
-                logger.info("开始使用浏览器上下文批量下载图片...")
-                downloaded_images = await self._download_images_with_browser(
-                    image_infos, prompt
-                )
+            final_result_blocks = []
+            for block in structured_blocks:
+                if block["type"] == "text":
+                    final_result_blocks.append(
+                        {"type": "text", "content": block["content"].strip()}
+                    )
+                elif block["type"] == "image":
+                    image_infos = block.get("content", [])
+                    if image_infos:
+                        downloaded_images = await self._download_images_with_browser(
+                            image_infos, prompt
+                        )
+                        if downloaded_images:
+                            downloaded_images.sort(key=lambda img: img.get("index", 99))
+                            final_result_blocks.append(
+                                {"type": "image", "content": downloaded_images}
+                            )
 
-                if not downloaded_images:
-                    raise ImageGenerationError("所有图片下载失败，请稍后重试")
-
-                downloaded_images.sort(key=lambda img: img.get("index", 99))
-                logger.info("✅ 已根据原始生成顺序对下载的图片进行排序。")
+            if not any(block.get("type") == "image" for block in final_result_blocks):
+                if not any(
+                    block.get("type") == "text" for block in final_result_blocks
+                ):
+                    raise ImageGenerationError("所有图片下载失败，且无文本内容")
 
             result = {
                 "success": True,
                 "prompt": prompt,
-                "count": len(downloaded_images),
-                "images": downloaded_images,
-                "text": final_text,
-                "api_type": api_type,
+                "structured_result": final_result_blocks,
+                "api_type": "doubao",
                 "use_cookies": bool(base_config.get("DOUBAO_COOKIES")),
             }
 
-            logger.info(
-                f"✅ AI内容生成成功: {len(downloaded_images)} 张图片, "
-                f"文本: '{final_text[:50]}...' (使用: {api_type})"
+            logger.debug(
+                f"✅ AI内容生成成功，共 {len(final_result_blocks)} 个内容块 (使用: doubao)"
             )
             return result
 
@@ -665,7 +709,7 @@ class DoubaoImageGenerator:
         results = []
 
         for i, prompt in enumerate(prompts):
-            logger.info(f"批量生成 {i + 1}/{len(prompts)}: {prompt}")
+            logger.debug(f"批量生成 {i + 1}/{len(prompts)}: {prompt}")
 
             try:
                 result = await self.generate_image(prompt)
