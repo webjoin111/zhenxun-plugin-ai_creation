@@ -147,7 +147,11 @@ async def dtemplate_superuser_handler(
             await cmd.finish("❌ 创建模板时发生意外错误，请检查后台日志。")
 
     elif sub := result.result.subcommands.get("optimize"):
-        template_name = sub.args["name"]
+        template_name = sub.args.get("name")
+        if not template_name:
+            await cmd.finish(
+                "❌ 优化失败：请提供要优化的模板名称。\n格式：绘图模板 optimize <名称> [指令]"
+            )
         instruction = sub.args.get("instruction", "")
 
         base_prompt = template_manager.get_prompt(template_name)
@@ -176,8 +180,16 @@ async def dtemplate_superuser_handler(
             await cmd.finish("❌ 优化模板时发生意外错误，请检查后台日志。")
 
     if sub := result.result.subcommands.get("add"):
-        name = sub.args["name"]
-        prompt = str(sub.args["prompt"])
+        name = sub.args.get("name")
+        if not name:
+            await dtemplate_superuser_cmd.finish(
+                "❌ 添加失败：请提供模板名称。\n格式：绘图模板 add <名称> <提示词>"
+            )
+        prompt = str(sub.args.get("prompt", ""))
+        if not prompt:
+            await dtemplate_superuser_cmd.finish(
+                "❌ 添加失败：请提供模板的提示词内容。"
+            )
         if await template_manager.add_template(name, prompt):
             await dtemplate_superuser_cmd.finish(f"✅ 成功添加模板 '{name}'。")
         else:
@@ -188,11 +200,27 @@ async def dtemplate_superuser_handler(
         if not names_to_delete:
             await dtemplate_superuser_cmd.finish("❌ 请提供至少一个要删除的模板名称。")
 
-        deleted_templates = []
-        failed_templates = []
+        all_templates = template_manager.list_templates()
+        template_keys = list(all_templates.keys())
+        names_to_actually_delete = set()
+        failed_inputs = []
 
         for name_input in names_to_delete:
-            resolved_name = await resolve_template_name_by_input(name_input, cmd)
+            if name_input.isdigit():
+                try:
+                    index = int(name_input) - 1
+                    if 0 <= index < len(template_keys):
+                        names_to_actually_delete.add(template_keys[index])
+                    else:
+                        failed_inputs.append(name_input)
+                except (ValueError, IndexError):
+                    failed_inputs.append(name_input)
+            else:
+                names_to_actually_delete.add(name_input)
+
+        deleted_templates = []
+        failed_templates = []
+        for resolved_name in names_to_actually_delete:
             if await template_manager.delete_template(resolved_name):
                 deleted_templates.append(resolved_name)
             else:
@@ -201,9 +229,11 @@ async def dtemplate_superuser_handler(
         message_parts = []
         if deleted_templates:
             message_parts.append(f"🗑️ 成功删除模板：{'、'.join(deleted_templates)}")
-        if failed_templates:
+
+        all_failed = failed_templates + failed_inputs
+        if all_failed:
             message_parts.append(
-                f"❌ 删除失败（未找到）：{'、'.join(failed_templates)}"
+                f"❌ 删除失败（未找到或序号无效）：{'、'.join(sorted(list(set(all_failed))))}"
             )
 
         await dtemplate_superuser_cmd.finish("\n".join(message_parts))
@@ -249,7 +279,7 @@ async def dtemplate_superuser_handler(
     elif sub := result.result.subcommands.get("edit"):
         template_input = str(sub.args.get("name", ""))
         resolved_name = await resolve_template_name_by_input(template_input, cmd)
-        prompt = str(sub.args["prompt"])
+        prompt = str(sub.args.get("prompt", ""))
         if await template_manager.update_template(resolved_name, prompt):
             await dtemplate_superuser_cmd.finish(f"✅ 成功更新模板 '{resolved_name}'。")
         else:

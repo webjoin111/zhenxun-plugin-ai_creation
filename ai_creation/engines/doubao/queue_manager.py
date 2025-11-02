@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 import time
 from typing import Any
@@ -41,7 +41,7 @@ class DrawRequest:
 
     def __post_init__(self):
         if self.created_at is None:
-            self.created_at = datetime.now()
+            self.created_at = datetime.now(timezone.utc).astimezone()
 
     @property
     def wait_time(self) -> float:
@@ -49,7 +49,9 @@ class DrawRequest:
         if self.started_at and self.created_at:
             return (self.started_at - self.created_at).total_seconds()
         elif self.created_at:
-            return (datetime.now() - self.created_at).total_seconds()
+            return (
+                datetime.now(timezone.utc).astimezone() - self.created_at
+            ).total_seconds()
         return 0.0
 
     @property
@@ -58,7 +60,9 @@ class DrawRequest:
         if self.started_at and self.completed_at:
             return (self.completed_at - self.started_at).total_seconds()
         elif self.started_at:
-            return (datetime.now() - self.started_at).total_seconds()
+            return (
+                datetime.now(timezone.utc).astimezone() - self.started_at
+            ).total_seconds()
         return 0.0
 
 
@@ -77,9 +81,11 @@ class DrawQueueManager:
         self._total_requests = 0
         self._average_processing_time = 60.0
         self._last_browser_close_time: datetime | None = None
+        self._last_activity_time: datetime | None = None
         self._browser_cooldown_seconds = 180
 
         self._queue_processor_task: asyncio.Task | None = None
+        self._idle_monitor_task: asyncio.Task | None = None
         self._shutdown = False
 
         logger.debug("AI绘图队列管理器已初始化")
@@ -92,6 +98,7 @@ class DrawQueueManager:
     async def shutdown_browser(self):
         """关闭常驻浏览器实例"""
         logger.debug("正在关闭常驻浏览器...")
+        self._last_activity_time = None
         self._guest_usage_count = 0
         await self.image_generator.cleanup()
 
@@ -102,7 +109,7 @@ class DrawQueueManager:
 
     def set_browser_close_time(self):
         """记录任务完成时间，并启动浏览器冷却期"""
-        self._last_browser_close_time = datetime.now()
+        self._last_browser_close_time = datetime.now(timezone.utc).astimezone()
         logger.info(
             f"任务处理完成，浏览器进入冷却期 ({self._browser_cooldown_seconds}秒)..."
         )
@@ -113,7 +120,9 @@ class DrawQueueManager:
             return False
 
         if self._last_browser_close_time:
-            elapsed = (datetime.now() - self._last_browser_close_time).total_seconds()
+            elapsed = (
+                datetime.now(timezone.utc).astimezone() - self._last_browser_close_time
+            ).total_seconds()
         else:
             elapsed = 0.0
         return elapsed < self._browser_cooldown_seconds
@@ -124,7 +133,9 @@ class DrawQueueManager:
             return 0.0
 
         if self._last_browser_close_time:
-            elapsed = (datetime.now() - self._last_browser_close_time).total_seconds()
+            elapsed = (
+                datetime.now(timezone.utc).astimezone() - self._last_browser_close_time
+            ).total_seconds()
         else:
             elapsed = 0.0
         return max(0.0, self._browser_cooldown_seconds - elapsed)
@@ -134,6 +145,7 @@ class DrawQueueManager:
     ) -> DrawRequest:
         """添加绘图请求到队列"""
         async with self._lock:
+            self._last_activity_time = datetime.now(timezone.utc).astimezone()
             request_id = f"{user_id}_{int(time.time() * 1000)}"
 
             queue_position = len(self._queue)
@@ -178,7 +190,7 @@ class DrawQueueManager:
 
             request = self._queue.pop(0)
             request.status = RequestStatus.PROCESSING
-            request.started_at = datetime.now()
+            request.started_at = datetime.now(timezone.utc).astimezone()
             self._processing_request = request
 
             logger.debug(f"开始处理请求 {request.request_id}")
@@ -188,7 +200,7 @@ class DrawQueueManager:
         """完成请求处理"""
         async with self._lock:
             request.status = RequestStatus.COMPLETED
-            request.completed_at = datetime.now()
+            request.completed_at = datetime.now(timezone.utc).astimezone()
             request.result = result
 
             processing_time = request.processing_time
@@ -209,12 +221,13 @@ class DrawQueueManager:
                 f"请求 {request.request_id} 处理完成，耗时: {processing_time:.1f}秒"
             )
             self.set_browser_close_time()
+            self._last_activity_time = datetime.now(timezone.utc).astimezone()
 
     async def fail_request(self, request: DrawRequest, error: str):
         """标记请求失败"""
         async with self._lock:
             request.status = RequestStatus.FAILED
-            request.completed_at = datetime.now()
+            request.completed_at = datetime.now(timezone.utc).astimezone()
             request.error = error
 
             self._completed_requests.append(request)
@@ -222,6 +235,7 @@ class DrawQueueManager:
 
             logger.error(f"请求 {request.request_id} 处理失败: {error}")
             self.set_browser_close_time()
+            self._last_activity_time = datetime.now(timezone.utc).astimezone()
 
     async def cancel_request(self, request_id: str) -> bool:
         """取消请求"""
@@ -334,14 +348,21 @@ class DrawQueueManager:
                 return
 
             try:
-                if base_config.get("ENABLE_DOUBAO_COOKIES"):
-                    from .cookie_manager import cookie_manager
+                from .cookie_manager import cookie_manager
 
+                use_cookies = (
+                    base_config.get("ENABLE_DOUBAO_COOKIES")
+                    and cookie_manager.get_total_cookie_count() > 0
+                )
+
+                if use_cookies:
                     selected_cookie = await cookie_manager.get_next_cookie()
                     if not selected_cookie:
                         raise RuntimeError("今日AI绘图额度已用尽，请明日再试。")
                     current_request.cookie = selected_cookie
                     await self.image_generator.update_session_cookie(selected_cookie)
+                else:
+                    await self.image_generator.update_session_cookie(None)
 
                 result = await self.image_generator.generate_image(
                     prompt=current_request.prompt,
@@ -360,7 +381,9 @@ class DrawQueueManager:
                     await self.complete_request(current_request, result)
 
                     if is_guest_draw and self._guest_usage_count >= 5:
-                        logger.info("无Cookie模式已达5次上限，将在本次任务完成后立即关闭浏览器。")
+                        logger.info(
+                            "无Cookie模式已达5次上限，将在本次任务完成后立即关闭浏览器。"
+                        )
                         await self.shutdown_browser()
                 else:
                     error_msg = result.get("error", "未知生成错误")
@@ -381,7 +404,9 @@ class DrawQueueManager:
     async def cleanup_old_requests(self, max_age_hours: int = 24):
         """清理旧的已完成请求"""
         async with self._lock:
-            cutoff_time = datetime.now() - timedelta(hours=max_age_hours)
+            cutoff_time = datetime.now(timezone.utc).astimezone() - timedelta(
+                hours=max_age_hours
+            )
             original_count = len(self._completed_requests)
 
             self._completed_requests = [
@@ -402,6 +427,50 @@ class DrawQueueManager:
                 self._queue_processor_loop()
             )
             logger.debug("队列处理器已启动")
+
+    def start_idle_monitor(self):
+        """启动浏览器闲置监控器"""
+        if self._idle_monitor_task is None or self._idle_monitor_task.done():
+            self._shutdown = False
+            self._idle_monitor_task = asyncio.create_task(self._idle_check_loop())
+            logger.debug("浏览器闲置监控器已启动")
+
+    async def stop_idle_monitor(self):
+        """停止浏览器闲置监控器"""
+        if self._idle_monitor_task and not self._idle_monitor_task.done():
+            self._idle_monitor_task.cancel()
+            try:
+                await self._idle_monitor_task
+            except asyncio.CancelledError:
+                pass
+            logger.debug("浏览器闲置监控器已停止")
+
+    async def _idle_check_loop(self):
+        """监控浏览器闲置并自动关闭"""
+        logger.debug("浏览器闲置监控循环已启动")
+        while not self._shutdown:
+            await asyncio.sleep(30)
+
+            timeout_minutes = base_config.get("browser_idle_timeout_minutes", 10)
+            if timeout_minutes <= 0:
+                continue
+
+            if (
+                not self.image_generator.is_initialized
+                or self._queue
+                or self._processing_request
+            ):
+                continue
+
+            if self._last_activity_time:
+                idle_seconds = (
+                    datetime.now(timezone.utc).astimezone() - self._last_activity_time
+                ).total_seconds()
+                if idle_seconds > timeout_minutes * 60:
+                    logger.info(
+                        f"浏览器闲置超过 {timeout_minutes} 分钟，将自动关闭以释放资源。"
+                    )
+                    await self.shutdown_browser()
 
     async def stop_queue_processor(self):
         """停止队列处理器"""

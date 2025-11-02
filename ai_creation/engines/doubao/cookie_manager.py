@@ -142,5 +142,9 @@ class DoubaoCookieManager:
             ]
         )
 
+    def get_total_cookie_count(self) -> int:
+        """获取配置的Cookie总数。"""
+        return len(self._cookie_states)
+
 
 cookie_manager = DoubaoCookieManager()

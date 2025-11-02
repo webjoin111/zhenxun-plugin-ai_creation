@@ -88,7 +88,7 @@ draw [附带图片] -o on 换成赛博朋克风格
     supported_adapters={"~onebot.v11"},
     extra=PluginExtraData(
         author="webjoin111",
-        version="1.2.0",
+        version="1.2.1",
         configs=[
             RegisterConfig(
                 module="ai_creation",
@@ -164,6 +164,12 @@ draw [附带图片] -o on 换成赛博朋克风格
                 key="draw_cd",
                 value=120,
                 help="AI绘图功能的冷却时间（秒）",
+            ),
+            RegisterConfig(
+                module="ai_creation",
+                key="browser_idle_timeout_minutes",
+                value=0,
+                help="浏览器在没有绘图任务时，闲置多少分钟后自动关闭。设置为 0 则禁用此功能。",
             ),
         ],
     ).dict(),
@@ -308,6 +314,7 @@ async def _():
         cooldown = base_config.get("browser_cooldown_seconds")
         draw_queue_manager.set_browser_cooldown(cooldown)
         await cookie_manager.load_and_sync_cookies()
+        draw_queue_manager.start_idle_monitor()
         draw_queue_manager.start_queue_processor()
         await templates.template_manager.initialize()
         logger.debug(f"AI Draw 插件核心服务已启动, 浏览器冷却时间: {cooldown}s")
@@ -320,6 +327,7 @@ async def ai_draw_shutdown():
     logger.debug("AI Draw Plugin: 正在关闭...")
     from .engines.doubao.queue_manager import draw_queue_manager
 
+    await draw_queue_manager.stop_idle_monitor()
     await draw_queue_manager.stop_queue_processor()
     await draw_queue_manager.shutdown_browser()
 

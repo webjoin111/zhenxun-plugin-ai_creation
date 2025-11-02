@@ -310,7 +310,9 @@ class DrawingService:
             logger.debug(f"检测到艾特 {len(user_ids_to_fetch)} 位用户，将获取头像...")
             platform = PlatformUtils.get_platform(self.ctx.bot)
             for uid in user_ids_to_fetch:
-                avatar_path = await avatar_service.get_avatar_path(platform, uid)
+                avatar_path = await avatar_service.get_avatar_path(
+                    platform, uid, force_refresh=True
+                )
                 if avatar_path and avatar_path.exists():
                     async with aiofiles.open(avatar_path, "rb") as f:
                         image_bytes_list.append(await f.read())
