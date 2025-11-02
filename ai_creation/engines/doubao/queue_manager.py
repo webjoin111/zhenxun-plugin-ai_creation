@@ -355,14 +355,16 @@ class DrawQueueManager:
                     and cookie_manager.get_total_cookie_count() > 0
                 )
 
+                selected_cookie = None
                 if use_cookies:
                     selected_cookie = await cookie_manager.get_next_cookie()
                     if not selected_cookie:
-                        raise RuntimeError("今日AI绘图额度已用尽，请明日再试。")
-                    current_request.cookie = selected_cookie
-                    await self.image_generator.update_session_cookie(selected_cookie)
-                else:
-                    await self.image_generator.update_session_cookie(None)
+                        logger.warning(
+                            "🍪 所有可用Cookie今日额度已用尽，将尝试使用无Cookie模式。"
+                        )
+
+                current_request.cookie = selected_cookie
+                await self.image_generator.update_session_cookie(selected_cookie)
 
                 result = await self.image_generator.generate_image(
                     prompt=current_request.prompt,
