@@ -9,6 +9,7 @@ from PIL import Image
 from zhenxun.services.log import logger
 
 from ...utils.downloader import IMAGE_DIR
+from .exceptions import ImageGenerationError
 from .. import DrawEngine
 from .queue_manager import RequestStatus, draw_queue_manager
 
@@ -92,11 +93,11 @@ class DoubaoEngine(DrawEngine):
             or not completed_request.result
         ):
             error_msg = completed_request.error or "未知错误"
-            raise RuntimeError(f"图片生成失败: {error_msg}")
+            raise ImageGenerationError(error_msg)
 
         structured_result = completed_request.result.get("structured_result", [])
         if not structured_result:
-            raise RuntimeError("图片生成失败：未获取到任何内容")
+            raise ImageGenerationError("图片生成失败：未获取到任何内容")
 
         for block in structured_result:
             if block["type"] == "image":

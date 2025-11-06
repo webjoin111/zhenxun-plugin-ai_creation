@@ -353,6 +353,8 @@ class DoubaoImageGenerator:
         这是一个无状态方法，所有状态都局限于本次调用。
         """
         generation_complete_event = asyncio.Event()
+        sse_error_event = asyncio.Event()
+        sse_error_message: list[str | None] = [None]
         content_order: list[dict[str, Any]] = []
         image_data_map: dict[str, list[str]] = {}
         current_text_buffer: list[str] = []
@@ -367,7 +369,16 @@ class DoubaoImageGenerator:
                 ):
                     return
 
-                body_bytes = await response.body()  # type: ignore
+                try:
+                    body_bytes = await response.body()  # type: ignore
+                except Exception as exc:
+                    if "No data found for resource with given identifier" in str(exc):
+                        error_str = f"SSE流中断，可能因内容审核失败或网络问题: {exc}"
+                        sse_error_message[0] = error_str
+                        sse_error_event.set()
+                    else:
+                        logger.warning(f"获取SSE响应体时发生非关键错误: {exc}")
+                    return
                 lines = body_bytes.decode("utf-8", errors="ignore").strip().split("\n")
                 for line in lines:
                     if not line.startswith("data:"):
@@ -439,7 +450,7 @@ class DoubaoImageGenerator:
                     except (json.JSONDecodeError, KeyError) as e:
                         logger.debug(f"跳过无法解析的SSE片段: {e}")
                     except Exception as inner_exc:
-                        logger.warning(f"SSE事件处理出现未知错误: {inner_exc}")
+                        logger.debug(f"SSE事件处理出现内部错误: {inner_exc}")
             except Exception as exc:
                 logger.warning(f"SSE拦截器处理响应失败: {exc}")
 
@@ -471,11 +482,25 @@ class DoubaoImageGenerator:
 
             signal_timeout = int(base_config.get("doubao_wait_signal_timeout", 120))
             try:
-                await asyncio.wait_for(
-                    generation_complete_event.wait(), timeout=signal_timeout
+                done, pending = await asyncio.wait(
+                    {
+                        asyncio.create_task(generation_complete_event.wait()),
+                        asyncio.create_task(sse_error_event.wait()),
+                    },
+                    return_when=asyncio.FIRST_COMPLETED,
+                    timeout=signal_timeout,
                 )
-                logger.debug("✅ 收到豆包SSE流结束信号，额外等待以确保数据完整。")
-                await asyncio.sleep(3)
+                for task in pending:
+                    task.cancel()
+
+                if sse_error_event.is_set():
+                    raise ImageGenerationError(sse_error_message[0])
+
+                if not done:
+                    raise asyncio.TimeoutError
+                else:
+                    logger.debug("✅ 收到豆包SSE流结束信号，额外等待以确保数据完整。")
+                    await asyncio.sleep(3)
             except asyncio.TimeoutError:
                 logger.warning(
                     f"等待生成完成信号超时 ({signal_timeout}s)。将尝试使用已收到的数据。"
@@ -507,8 +532,8 @@ class DoubaoImageGenerator:
             return structured_result
 
         except Exception as e:
-            logger.error("豆包图片生成失败", e=e)
-            raise ImageGenerationError(f"豆包图片生成失败: {e}") from e
+            logger.debug("底层豆包图片生成流程捕获到异常", e=e)
+            raise ImageGenerationError(f"{e}") from e
         finally:
             if self.page:
                 self.page.remove_listener("response", _local_sse_handler)

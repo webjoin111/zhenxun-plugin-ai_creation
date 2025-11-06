@@ -57,7 +57,7 @@ async def solve_drag_captcha_if_present(page: Page) -> bool:
         captcha_container = page.locator("#captcha_container")
         await captcha_container.wait_for(state="visible", timeout=5000)
 
-        logger.debug("检测到验证码，启动处理程序...")
+        logger.info("检测到验证码，启动处理程序...")
         solved = False
         for i in range(3):
             if await _solve_drag_captcha_attempt(page):
@@ -75,7 +75,7 @@ async def solve_drag_captcha_if_present(page: Page) -> bool:
         return True
 
     except PlaywrightTimeoutError:
-        logger.debug("未检测到验证码弹窗，流程继续。")
+        logger.info("未检测到验证码弹窗，流程继续。")
         return False
 
 
@@ -165,7 +165,7 @@ async def _solve_drag_captcha_attempt(page: Page) -> bool:
         logger.debug("   - 已点击提交按钮，等待验证码弹窗消失...")
 
         await captcha_container.wait_for(state="hidden", timeout=10000)
-        logger.debug("✅ 验证码成功解决！")
+        logger.info("✅ 验证码成功解决！")
         return True
 
     except PlaywrightTimeoutError:

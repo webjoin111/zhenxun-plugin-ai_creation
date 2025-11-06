@@ -14,6 +14,7 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.exception import FinishedException
 from nonebot_plugin_alconna import AlconnaMatcher, At, CommandResult, UniMessage
 from nonebot_plugin_alconna.uniseg import Image as UniImage
+from playwright.async_api import Error as PlaywrightError
 from pydantic import BaseModel, Field
 
 from zhenxun.services import avatar_service
@@ -32,6 +33,7 @@ from zhenxun.utils.platform import PlatformUtils
 from zhenxun.utils.time_utils import TimeUtils
 
 from ..config import SYSTEM_PROMPT_FUSION, SYSTEM_PROMPT_OPTIMIZE, base_config
+from ..engines.doubao.exceptions import ImageGenerationError
 from ..engines import DrawEngine, get_engine
 from ..engines.llm_api import LlmApiEngine
 from ..templates import template_manager
@@ -506,6 +508,13 @@ class DrawingService:
                 self.ctx.final_prompt, self.ctx.image_bytes_list
             )
             self.ctx.draw_result = draw_result
+
+        except (ImageGenerationError, PlaywrightError) as e:
+            logger.debug(f"捕获到预期的绘图引擎错误: {e}")
+            friendly_message = get_user_friendly_error_message(e)
+            if "no data found for resource" in str(e).lower():
+                friendly_message = "图片生成失败，可能因为内容审核未通过或网络不稳定。"
+            await self.ctx.matcher.finish(f"❌ 图片生成失败: {friendly_message}")
 
         except Exception as e:
             logger.error(
