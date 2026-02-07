@@ -26,6 +26,7 @@ from zhenxun.services.llm import (
     unimsg_to_llm_parts,
 )
 from zhenxun.services.llm.config import LLMGenerationConfig
+from zhenxun.services.llm.config.generation import OutputConfig
 from zhenxun.services.llm.types import get_user_friendly_error_message
 from zhenxun.services.log import logger
 from zhenxun.utils.http_utils import AsyncHttpx
@@ -173,7 +174,9 @@ async def _optimize_draw_prompt(
         if "gemini" in base_config.get("auxiliary_llm_model", "").lower():
             gen_config = CommonOverrides.gemini_json()
         else:
-            gen_config = LLMGenerationConfig(response_format={"type": "json_object"})
+            gen_config = LLMGenerationConfig(
+                output=OutputConfig(response_format={"type": "json_object"})
+            )
 
         content_parts = await unimsg_to_llm_parts(user_message)
         if not content_parts and not template_prompt:
@@ -247,6 +250,7 @@ class DrawingContext(BaseModel):
     user_prompt: str = ""
     template_prompt: str | None = None
     final_prompt: str = ""
+    image_size: str | None = None
     engine_name: str = ""
     engine: DrawEngine | None = Field(None, exclude=True)
     draw_result: dict[str, Any] | list[dict[str, Any]] | None = None
@@ -423,6 +427,9 @@ class DrawingService:
         if not engine_name:
             await matcher.finish("❌ 错误：未配置默认绘图引擎，请联系管理员。")
 
+        if size_option := options.get("size"):
+            self.ctx.image_size = size_option.args.get("img_size")
+
         if (
             engine_name.lower() == "api"
             and not self.ctx.is_superuser
@@ -504,8 +511,16 @@ class DrawingService:
             await self.ctx.matcher.finish("❌ 绘图引擎实例未创建。")
 
         try:
+            gen_config = None
+            if self.ctx.image_size:
+                from zhenxun.services.llm.config.generation import GenConfigBuilder
+
+                builder = GenConfigBuilder()
+                builder.config_visual(resolution=self.ctx.image_size)
+                gen_config = builder.build()
+
             draw_result = await self.ctx.engine.draw(
-                self.ctx.final_prompt, self.ctx.image_bytes_list
+                self.ctx.final_prompt, self.ctx.image_bytes_list, config=gen_config
             )
             self.ctx.draw_result = draw_result
 

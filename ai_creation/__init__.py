@@ -88,7 +88,7 @@ draw [附带图片] -o on 换成赛博朋克风格
     supported_adapters={"~onebot.v11"},
     extra=PluginExtraData(
         author="webjoin111",
-        version="1.2.1",
+        version="1.2.5",
         configs=[
             RegisterConfig(
                 module="ai_creation",
@@ -190,6 +190,11 @@ draw_alconna = Alconna(
         Args["template_name", str],
         help_text="使用一个预设的风格模板",
     ),
+    Option(
+        "--size|-s",
+        Args["img_size", str],
+        help_text="指定生成分辨率 (部分模型支持: 1K, 2K, 4K)",
+    ),
     Args[
         "prompt?",
         MultiVar(str | UniImage),
@@ -223,14 +228,9 @@ dtemplate_alc = Alconna(
         alias=["ls"],
         help_text="列出所有可用的绘图模板",
     ),
-    Subcommand(
-        "info",
-        Args["name", str],
-        help_text="查看一个模板的详细内容",
-    ),
     meta=CommandMeta(
         description="AI绘图模板管理",
-        usage=("绘图模板 list\n绘图模板 info <模板名称>"),
+        usage=("绘图模板 list"),
     ),
 )
 
@@ -241,6 +241,11 @@ dtemplate_superuser_alc = Alconna(
         Args["prompt?", MultiVar(str | UniImage)],
         alias=["创建"],
         help_text="基于图片和文本创建新模板",
+    ),
+    Subcommand(
+        "info",
+        Args["name", str],
+        help_text="查看一个模板的详细内容",
     ),
     Subcommand(
         "optimize",
@@ -276,6 +281,7 @@ dtemplate_superuser_alc = Alconna(
         description="AI绘图模板管理 (超级用户)",
         usage=(
             "绘图模板 create [图片] [描述] -> 进入创建会话\n"
+            "绘图模板 info <模板名称>\n"
             "绘图模板 optimize <名称> [优化指令] -> 进入优化会话\n"
             "绘图模板 add <名称> <提示词>\n"
             "绘图模板 del <名称1> [名称2] ...\n"

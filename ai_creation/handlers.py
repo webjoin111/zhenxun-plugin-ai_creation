@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from zhenxun import ui
 from zhenxun.services.llm import generate_structured, message_to_unimessage
 from zhenxun.services.log import logger
-from zhenxun.ui.builders import TableBuilder
+from zhenxun.ui.models.core import TableData
 
 from . import (
     draw_cmd,
@@ -76,35 +76,25 @@ class TemplateRefinementResponse(BaseModel):
 
 @dtemplate_public_cmd.handle()
 async def dtemplate_handler(result: CommandResult, cmd: AlconnaMatcher):
-    """绘图模板命令处理器 (list, info)"""
-    if sub := result.result.subcommands.get("list"):
+    """绘图模板命令处理器 (list)"""
+    if sub := result.result.subcommands.get("list"):  # noqa: F841
         templates = template_manager.list_templates()
         if not templates:
             await dtemplate_public_cmd.finish("当前没有任何绘图模板。")
 
-        builder = TableBuilder(
-            title="AI绘图模板列表", tip=f"共 {len(templates)} 个模板"
+        builder = TableData(
+            title="AI绘图模板列表",
+            tip=f"共 {len(templates)} 个模板",
+            headers=[],
+            rows=[],
         )
         builder.set_headers(["序号", "模板名称", "提示词预览"])
         for i, (name, prompt) in enumerate(templates.items(), 1):
             preview = (prompt[:30] + "...") if len(prompt) > 30 else prompt
             builder.add_row([str(i), name, preview.replace("\n", " ")])
 
-        img = await ui.render(builder.build(), use_cache=False)
+        img = await ui.render(builder, use_cache=False)
         await dtemplate_public_cmd.finish(UniMessage.image(raw=img))
-
-    elif sub := result.result.subcommands.get("info"):
-        template_input = str(sub.args.get("name", ""))
-        resolved_name = await resolve_template_name_by_input(template_input, cmd)
-        prompt = template_manager.get_prompt(resolved_name)
-        if prompt:
-            await dtemplate_public_cmd.finish(
-                f"🎨 模板 '{resolved_name}' 的内容如下：\n\n{prompt}"
-            )
-        else:
-            await dtemplate_public_cmd.finish(
-                f"❌ 未找到名为 '{resolved_name}' 的模板。"
-            )
 
 
 @dtemplate_superuser_cmd.handle()
@@ -112,7 +102,19 @@ async def dtemplate_superuser_handler(
     result: CommandResult, cmd: AlconnaMatcher, event: MessageEvent, msg: UniMsg
 ):
     """绘图模板管理命令处理器 (超级用户)"""
-    if sub := result.result.subcommands.get("create"):
+    if sub := result.result.subcommands.get("info"):
+        template_input = str(sub.args.get("name", ""))
+        resolved_name = await resolve_template_name_by_input(template_input, cmd)
+        prompt = template_manager.get_prompt(resolved_name)
+        if prompt:
+            await dtemplate_superuser_cmd.finish(
+                f"🎨 模板 '{resolved_name}' 的内容如下：\n\n{prompt}"
+            )
+        else:
+            await dtemplate_superuser_cmd.finish(
+                f"❌ 未找到名为 '{resolved_name}' 的模板。"
+            )
+    elif sub := result.result.subcommands.get("create"):
         main_args = sub.args.get("prompt", [])
         user_intent_message = UniMessage(main_args)
 
@@ -179,7 +181,7 @@ async def dtemplate_superuser_handler(
             logger.error("处理 preset optimize 命令时发生未知错误", e=e)
             await cmd.finish("❌ 优化模板时发生意外错误，请检查后台日志。")
 
-    if sub := result.result.subcommands.get("add"):
+    elif sub := result.result.subcommands.get("add"):
         name = sub.args.get("name")
         if not name:
             await dtemplate_superuser_cmd.finish(

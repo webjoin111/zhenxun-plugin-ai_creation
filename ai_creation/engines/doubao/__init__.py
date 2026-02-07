@@ -18,7 +18,10 @@ class DoubaoEngine(DrawEngine):
     """使用 Playwright 模拟豆包网站的绘图引擎"""
 
     async def draw(
-        self, prompt: str, image_bytes: list[bytes] | None = None
+        self,
+        prompt: str,
+        image_bytes: list[bytes] | None = None,
+        config: Any | None = None,
     ) -> list[dict[str, Any]]:
         prompt_str = ""
         if isinstance(prompt, list):

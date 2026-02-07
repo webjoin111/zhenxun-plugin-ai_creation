@@ -8,7 +8,7 @@ from typing import Any
 from zhenxun.services.log import logger
 
 from ...config import base_config
-from .generator import DoubaoImageGenerator, ImageGenerationError
+from .generator import DoubaoImageGenerator, ImageGenerationError, CookieInvalidError
 
 
 class RequestStatus(Enum):
@@ -347,59 +347,79 @@ class DrawQueueManager:
             if not current_request:
                 return
 
-            try:
-                from .cookie_manager import cookie_manager
+            while True:
+                try:
+                    from .cookie_manager import cookie_manager
 
-                use_cookies = (
-                    base_config.get("ENABLE_DOUBAO_COOKIES")
-                    and cookie_manager.get_total_cookie_count() > 0
-                )
+                    use_cookies = (
+                        base_config.get("ENABLE_DOUBAO_COOKIES")
+                        and cookie_manager.get_total_cookie_count() > 0
+                    )
 
-                selected_cookie = None
-                if use_cookies:
-                    selected_cookie = await cookie_manager.get_next_cookie()
-                    if not selected_cookie:
-                        logger.warning(
-                            "🍪 所有可用Cookie今日额度已用尽，将尝试使用无Cookie模式。"
+                    selected_cookie = None
+                    if use_cookies:
+                        selected_cookie = await cookie_manager.get_next_cookie()
+                        if not selected_cookie:
+                            logger.warning(
+                                "🍪 所有可用Cookie额度已用尽或已失效，将尝试使用无Cookie模式。"
+                            )
+
+                    current_request.cookie = selected_cookie
+                    await self.image_generator.update_session_cookie(selected_cookie)
+
+                    result = await self.image_generator.generate_image(
+                        prompt=current_request.prompt,
+                        count=1,
+                        image_paths=current_request.image_paths,
+                        check_login=bool(selected_cookie),
+                    )
+
+                    if result.get("success"):
+                        is_guest_draw = not current_request.cookie
+                        if is_guest_draw:
+                            self._guest_usage_count += 1
+                            logger.info(
+                                f"无Cookie模式使用次数: {self._guest_usage_count}/5"
+                            )
+
+                        await self.complete_request(current_request, result)
+
+                        if is_guest_draw and self._guest_usage_count >= 5:
+                            logger.info(
+                                "无Cookie模式已达5次上限，将在本次任务完成后立即关闭浏览器。"
+                            )
+                            await self.shutdown_browser()
+                        break
+                    else:
+                        error_msg = result.get("error", "未知生成错误")
+                        await self.fail_request(current_request, error_msg)
+                        break
+
+                except CookieInvalidError:
+                    if current_request.cookie:
+                        logger.error(
+                            "🚫 检测到当前Cookie已失效，正在标记并自动切换下一个..."
                         )
-
-                current_request.cookie = selected_cookie
-                await self.image_generator.update_session_cookie(selected_cookie)
-
-                result = await self.image_generator.generate_image(
-                    prompt=current_request.prompt,
-                    count=1,
-                    image_paths=current_request.image_paths,
-                )
-
-                if result.get("success"):
-                    is_guest_draw = not current_request.cookie
-                    if is_guest_draw:
-                        self._guest_usage_count += 1
-                        logger.info(
-                            f"无Cookie模式使用次数: {self._guest_usage_count}/5"
-                        )
-
-                    await self.complete_request(current_request, result)
-
-                    if is_guest_draw and self._guest_usage_count >= 5:
-                        logger.info(
-                            "无Cookie模式已达5次上限，将在本次任务完成后立即关闭浏览器。"
-                        )
+                        await cookie_manager.mark_cookie_invalid(current_request.cookie)
                         await self.shutdown_browser()
-                else:
-                    error_msg = result.get("error", "未知生成错误")
-                    await self.fail_request(current_request, error_msg)
+                        continue
+                    else:
+                        await self.fail_request(
+                            current_request, "游客模式检测到异常状态"
+                        )
+                        break
 
-            except (ImageGenerationError, RuntimeError) as e:
-                logger.error(f"图片生成发生可恢复错误: {e}")
-                logger.error("发生RuntimeError，将关闭浏览器实例以待下次自愈...")
-                await self.shutdown_browser()
-                await self.fail_request(current_request, str(e))
-            except Exception as e:
-                await self.fail_request(current_request, str(e))
-                logger.error("发生严重未知错误，将关闭浏览器实例以待下次重启...")
-                await self.shutdown_browser()
+                except (ImageGenerationError, RuntimeError) as e:
+                    logger.error(f"图片生成发生可恢复错误: {e}")
+                    logger.error("发生运行时错误，将关闭浏览器实例以待下次自愈...")
+                    await self.shutdown_browser()
+                    await self.fail_request(current_request, str(e))
+                    break
+                except Exception as e:
+                    await self.fail_request(current_request, str(e))
+                    logger.error("发生严重未知错误，将关闭浏览器实例以待下次重启...")
+                    await self.shutdown_browser()
+                    break
 
             return current_request
 

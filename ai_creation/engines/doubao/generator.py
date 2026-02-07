@@ -3,13 +3,15 @@ import base64
 from datetime import datetime
 import hashlib
 import json
-from typing import Any
+import random
+from typing import Any, cast
 
 from playwright.async_api import (
     Browser,
     BrowserContext,
     Page,
     TimeoutError as PlaywrightTimeoutError,
+    ViewportSize,
     async_playwright,
 )
 from playwright_stealth import Stealth
@@ -18,7 +20,87 @@ from zhenxun.services.log import logger
 
 from ...config import DOUBAO_SELECTORS, base_config
 from ...utils.downloader import IMAGE_DIR, ImageDownloader
-from .exceptions import ImageGenerationError
+from .exceptions import ImageGenerationError, CookieInvalidError
+
+REALISTIC_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+]
+
+COMMON_VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 1366, "height": 768},
+    {"width": 1440, "height": 900},
+    {"width": 1536, "height": 864},
+    {"width": 1280, "height": 720},
+]
+
+HARDWARE_CONCURRENCY_OPTS = [4, 8, 12, 16]
+DEVICE_MEMORY_OPTS = [4, 8, 16, 32]
+
+
+class HumanActionUtils:
+    """拟人化操作工具类"""
+
+    @staticmethod
+    async def random_sleep(min_s: float = 0.5, max_s: float = 1.5):
+        """高斯分布随机等待"""
+        mean = (min_s + max_s) / 2
+        sigma = (max_s - min_s) / 4
+        sleep_time = random.gauss(mean, sigma)
+        sleep_time = max(min_s, min(max_s, sleep_time))
+        await asyncio.sleep(sleep_time)
+
+    @classmethod
+    async def human_move_to(cls, page: Page, element, steps: int = 25):
+        """模拟人类鼠标移动轨迹（分段逼近 + 变速）"""
+        box = await element.bounding_box()
+        if not box:
+            return
+
+        target_x = box["x"] + random.uniform(box["width"] * 0.2, box["width"] * 0.8)
+        target_y = box["y"] + random.uniform(box["height"] * 0.2, box["height"] * 0.8)
+
+        offset_x = random.uniform(-50, 50)
+        offset_y = random.uniform(-50, 50)
+        mid_x = target_x + offset_x
+        mid_y = target_y + offset_y
+
+        await page.mouse.move(mid_x, mid_y, steps=max(2, int(steps * 0.6)))
+
+        await page.mouse.move(target_x, target_y, steps=steps)
+
+    @classmethod
+    async def random_mouse_wander(cls, page: Page, count: int = 2):
+        """鼠标随机游走（模拟无意识晃动）"""
+        for _ in range(count):
+            x = random.randint(100, 1000)
+            y = random.randint(100, 800)
+            await page.mouse.move(x, y, steps=random.randint(10, 50))
+            await asyncio.sleep(random.uniform(0.1, 0.5))
+
+    @classmethod
+    async def perform_keep_alive(cls, page: Page, stop_event: asyncio.Event):
+        """后台保活任务：在等待生成时执行微小动作"""
+        logger.debug("启动拟人化保活(噪音)任务...")
+        while not stop_event.is_set():
+            try:
+                if random.random() > 0.3:
+                    action = random.choice(["scroll", "move"])
+                    if action == "scroll":
+                        delta_y = random.randint(50, 200)
+                        await page.mouse.wheel(0, delta_y)
+                        await asyncio.sleep(random.uniform(0.5, 1.5))
+                        await page.mouse.wheel(0, -delta_y)
+                    elif action == "move":
+                        await cls.random_mouse_wander(page, count=1)
+
+                await asyncio.sleep(random.uniform(2.0, 5.0))
+            except Exception:
+                break
 
 
 class DoubaoImageGenerator:
@@ -66,19 +148,46 @@ class DoubaoImageGenerator:
             if self.browser is None:
                 logger.error("浏览器未初始化")
                 return False
+
+            selected_ua = random.choice(REALISTIC_USER_AGENTS)
+            selected_viewport = random.choice(COMMON_VIEWPORTS)
+
+            hw_concurrency = random.choice(HARDWARE_CONCURRENCY_OPTS)
+            device_memory = random.choice(DEVICE_MEMORY_OPTS)
+
+            logger.debug(
+                f"指纹配置: Res={selected_viewport['width']}x{selected_viewport['height']}, CPU={hw_concurrency}, Mem={device_memory}"
+            )
+
             self.context = await self.browser.new_context(
-                viewport={"width": 1920, "height": 1080},
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/137.0.0.0 Safari/537.36"
-                ),
+                viewport=cast(ViewportSize, selected_viewport),
+                user_agent=selected_ua,
+                locale="zh-CN",
+                timezone_id="Asia/Shanghai",
+                device_scale_factor=random.choice([1, 1.25, 1.5]),
             )
 
             if self.context is None:
                 logger.error("浏览器上下文未初始化")
                 return False
+
             await Stealth().apply_stealth_async(self.context)
+
+            await self.context.add_init_script(f"""
+                Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {hw_concurrency} }});
+                Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {device_memory} }});
+                // 简单的 WebGL 干扰（微小的指纹噪声）
+                const getParameter = WebGLRenderingContext.prototype.getParameter;
+                WebGLRenderingContext.prototype.getParameter = function(parameter) {{
+                    // 37446 是 RENDERER
+                    if (parameter === 37446) {{
+                        const result = getParameter.apply(this, [parameter]);
+                        return result + ' (Custom Build)';
+                    }}
+                    return getParameter.apply(this, [parameter]);
+                }};
+            """)
+
             self.page = await self.context.new_page()
 
             logger.debug("豆包图片生成器浏览器初始化成功")
@@ -204,6 +313,9 @@ class DoubaoImageGenerator:
             title = await self.page.title()
             logger.debug(f"页面标题: {title}")
 
+            await HumanActionUtils.random_sleep(0.5, 1.5)
+            await HumanActionUtils.random_mouse_wander(self.page)
+
             return True
 
         except Exception as e:
@@ -313,16 +425,85 @@ class DoubaoImageGenerator:
             return False
 
         try:
-            logger.debug("使用回车键提交豆包生成请求")
-            await self.page.keyboard.press("Enter")
+            logger.debug("等待并点击豆包提交按钮...")
+            try:
+                submit_button = self.page.locator("button#flow-end-msg-send")
 
-            await asyncio.sleep(2)
-            logger.debug("等待豆包图片生成...")
-            return True
+                await HumanActionUtils.human_move_to(self.page, submit_button)
+                await HumanActionUtils.random_sleep(0.3, 0.7)
 
+                box = await submit_button.bounding_box()
+                if box:
+                    await self.page.mouse.down()
+                    await asyncio.sleep(random.uniform(0.08, 0.15))
+                    await self.page.mouse.up()
+                else:
+                    await submit_button.click()
+
+                await HumanActionUtils.random_sleep(1.0, 2.0)
+                logger.debug("等待豆包图片生成 (点击按钮成功)...")
+                return True
+            except PlaywrightTimeoutError:
+                logger.warning("点击提交按钮超时，尝试使用回车键作为备选方法...")
+                input_element = None
+                for selector in DOUBAO_SELECTORS["prompt_input"]:
+                    if not self.page or self.page.is_closed():
+                        logger.error("备选方法失败：页面已关闭。")
+                        return False
+                    element = await self.page.query_selector(selector)
+                    if element and await element.is_visible():
+                        input_element = element
+                        logger.debug(f"找到用于回车的输入框: {selector}")
+                        break
+
+                if not input_element:
+                    logger.error("备选方法失败：未能找到输入框来发送回车键。")
+                    return False
+
+                await input_element.press("Enter", delay=random.randint(50, 150))
+                await HumanActionUtils.random_sleep(1.0, 2.0)
+                logger.info("✅ 备选方法：成功通过回车键提交生成请求。")
+                logger.debug("等待豆包图片生成 (回车键成功)...")
+                return True
         except Exception as e:
-            logger.error(f"提交生成请求失败: {e}")
+            logger.error(f"提交生成请求时发生未知错误: {e}", e=e)
             return False
+
+    async def check_login_status(self):
+        """
+        通过UI元素检测当前的登录状态。
+        """
+        if not self.page:
+            return
+
+        selector_login_btn = 'button[data-testid="to_login_button"]'
+        selector_avatar = ".semi-avatar-no-focus-visible"
+
+        try:
+            logger.debug("正在检查登录状态 (UI检测)...")
+            element = await self.page.wait_for_selector(
+                f"{selector_login_btn}, {selector_avatar}",
+                state="visible",
+                timeout=8000,
+            )
+
+            if element:
+                is_login_btn = await element.evaluate(
+                    f"(el) => el.matches('{selector_login_btn}')"
+                )
+
+                if is_login_btn:
+                    logger.warning("检测到页面存在登录按钮，判断为Cookie失效。")
+                    raise CookieInvalidError("页面显示未登录状态。")
+                else:
+                    logger.debug("检测到用户头像，登录状态有效。")
+
+        except PlaywrightTimeoutError:
+            logger.warning("检查登录状态超时，未找到登录按钮或头像，将尝试继续执行。")
+        except CookieInvalidError:
+            raise
+        except Exception as e:
+            logger.warning(f"检查登录状态时发生意外错误: {e}")
 
     async def _handle_captcha_if_present(self) -> bool:
         """
@@ -346,7 +527,10 @@ class DoubaoImageGenerator:
         return await solve_drag_captcha_if_present(self.page)
 
     async def generate_doubao_image(
-        self, prompt: str, image_paths: list[str] | None = None
+        self,
+        prompt: str,
+        image_paths: list[str] | None = None,
+        check_login: bool = False,
     ) -> list[dict[str, Any]]:
         """
         使用豆包生成图片，并返回文本和带索引的图片信息列表。
@@ -354,6 +538,7 @@ class DoubaoImageGenerator:
         """
         generation_complete_event = asyncio.Event()
         sse_error_event = asyncio.Event()
+        page_closed_event = asyncio.Event()
         sse_error_message: list[str | None] = [None]
         content_order: list[dict[str, Any]] = []
         image_data_map: dict[str, list[str]] = {}
@@ -434,14 +619,28 @@ class DoubaoImageGenerator:
                                 urls = []
                                 for creation in creations:
                                     image_info = creation.get("image", {})
-                                    url = (
-                                        image_info.get("image_ori_raw", {}).get("url")
-                                        or image_info.get("image_ori", {}).get("url")
-                                        or image_info.get("image_preview", {}).get(
+                                    if raw_url_info := image_info.get("image_ori_raw"):
+                                        logger.debug(
+                                            f"  -> 发现 image_ori_raw 链接: {raw_url_info.get('url')}"
+                                        )
+                                    if ori_url_info := image_info.get("image_ori"):
+                                        logger.debug(
+                                            f"  -> 发现 image_ori 链接: {ori_url_info.get('url')}"
+                                        )
+
+                                    url = None
+                                    if raw_url := image_info.get(
+                                        "image_ori_raw", {}
+                                    ).get("url"):
+                                        if "_pre_" not in raw_url:
+                                            url = raw_url
+                                    if not url and (
+                                        ori_url := image_info.get("image_ori", {}).get(
                                             "url"
                                         )
-                                        or image_info.get("image_thumb", {}).get("url")
-                                    )
+                                    ):
+                                        if "_pre_" not in ori_url:
+                                            url = ori_url
                                     if url:
                                         urls.append(url)
                                 if message_id and urls:
@@ -454,12 +653,20 @@ class DoubaoImageGenerator:
             except Exception as exc:
                 logger.warning(f"SSE拦截器处理响应失败: {exc}")
 
+        def _on_page_close(page=None):
+            logger.warning("检测到豆包浏览器页面被关闭。")
+            page_closed_event.set()
+
         if self.page:
             self.page.on("response", _local_sse_handler)
+            self.page.on("close", _on_page_close)
 
         try:
             if not await self.navigate_to_create_image():
                 raise ImageGenerationError("导航到豆包图片创建页面失败")
+
+            if check_login:
+                await self.check_login_status()
 
             if image_paths:
                 logger.debug(f"检测到 {len(image_paths)} 张图片输入，开始上传...")
@@ -481,17 +688,32 @@ class DoubaoImageGenerator:
                 generation_complete_event.clear()
 
             signal_timeout = int(base_config.get("doubao_wait_signal_timeout", 120))
+
+            keep_alive_task = None
+            if self.page:
+                keep_alive_task = asyncio.create_task(
+                    HumanActionUtils.perform_keep_alive(
+                        self.page, generation_complete_event
+                    )
+                )
+
             try:
                 done, pending = await asyncio.wait(
                     {
                         asyncio.create_task(generation_complete_event.wait()),
                         asyncio.create_task(sse_error_event.wait()),
+                        asyncio.create_task(page_closed_event.wait()),
                     },
                     return_when=asyncio.FIRST_COMPLETED,
                     timeout=signal_timeout,
                 )
                 for task in pending:
                     task.cancel()
+
+                if page_closed_event.is_set():
+                    raise ImageGenerationError(
+                        "绘图过程中浏览器页面意外关闭，任务终止。"
+                    )
 
                 if sse_error_event.is_set():
                     raise ImageGenerationError(sse_error_message[0])
@@ -505,6 +727,13 @@ class DoubaoImageGenerator:
                 logger.warning(
                     f"等待生成完成信号超时 ({signal_timeout}s)。将尝试使用已收到的数据。"
                 )
+            finally:
+                if keep_alive_task and not keep_alive_task.done():
+                    keep_alive_task.cancel()
+                    try:
+                        await keep_alive_task
+                    except asyncio.CancelledError:
+                        pass
 
             if current_text_buffer:
                 content_order.append(
@@ -531,12 +760,18 @@ class DoubaoImageGenerator:
 
             return structured_result
 
+        except CookieInvalidError:
+            raise
         except Exception as e:
             logger.debug("底层豆包图片生成流程捕获到异常", e=e)
             raise ImageGenerationError(f"{e}") from e
         finally:
             if self.page:
                 self.page.remove_listener("response", _local_sse_handler)
+                try:
+                    self.page.remove_listener("close", _on_page_close)
+                except Exception:
+                    pass
 
     async def _download_images_with_browser(
         self, image_infos: list[dict[str, Any]], prompt: str
@@ -555,6 +790,8 @@ class DoubaoImageGenerator:
         ]
 
         logger.info(f"开始批量下载 {len(urls_with_index)} 张图片...")
+        for item in urls_with_index:
+            logger.debug(f"  -> 准备下载图片: {item['url']}")
 
         try:
             download_results = await self.page.evaluate(
@@ -662,6 +899,7 @@ class DoubaoImageGenerator:
         prompt: str,
         count: int = 1,
         image_paths: list[str] | None = None,
+        check_login: bool = False,
     ) -> dict[str, Any]:
         """生成AI图片"""
         try:
@@ -673,7 +911,9 @@ class DoubaoImageGenerator:
             else:
                 logger.debug(f"🎨 开始生成AI图片: {prompt}")
 
-            structured_blocks = await self.generate_doubao_image(prompt, image_paths)
+            structured_blocks = await self.generate_doubao_image(
+                prompt, image_paths, check_login
+            )
 
             if not structured_blocks:
                 raise ImageGenerationError("未能生成任何内容")
@@ -715,6 +955,8 @@ class DoubaoImageGenerator:
             )
             return result
 
+        except CookieInvalidError:
+            raise
         except Exception as e:
             logger.error(f"AI图片生成失败: {e}")
             return {

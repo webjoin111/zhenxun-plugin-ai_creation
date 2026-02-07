@@ -11,7 +11,10 @@ class LlmApiEngine(DrawEngine):
     """使用 zhenxun.services.llm API 的绘图引擎"""
 
     async def draw(
-        self, prompt: str, image_bytes: list[bytes] | None = None
+        self,
+        prompt: str,
+        image_bytes: list[bytes] | None = None,
+        config: Any | None = None,
     ) -> dict[str, Any]:
         logger.debug("🎨 使用 LLM API 引擎进行绘图...")
         draw_model_name = base_config.get("api_draw_model")
@@ -22,6 +25,7 @@ class LlmApiEngine(DrawEngine):
             prompt=prompt,
             images=image_bytes,  # type: ignore
             model=draw_model_name,
+            config=config,
         )
         images = response.images or []
         return {"images": images, "text": response.text}

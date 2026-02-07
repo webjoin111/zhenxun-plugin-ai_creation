@@ -59,7 +59,7 @@ class DoubaoCookieManager:
         else:
             config_cookies = set()
 
-        old_states: dict[str, int] = {}
+        old_states: dict[str, dict] = {}
         last_reset_date_str = ""
         if STATE_FILE.exists():
             try:
@@ -71,8 +71,9 @@ class DoubaoCookieManager:
                         for state in saved_data.get("cookies", []):
                             cookie_val = state.get("cookie")
                             usage_val = state.get("usage", 0)
+                            valid_val = state.get("valid", True)
                             if isinstance(cookie_val, str):
-                                old_states[cookie_val] = int(usage_val)
+                                old_states[cookie_val] = {"usage": int(usage_val), "valid": valid_val}
             except Exception as e:
                 logger.error(f"读取Cookie状态文件失败: {e}")
 
@@ -87,8 +88,10 @@ class DoubaoCookieManager:
 
         synced_states: list[dict[str, Any]] = []
         for cookie in config_cookies:
-            usage = old_states.get(cookie, 0)
-            synced_states.append({"cookie": cookie, "usage": usage})
+            old_state = old_states.get(cookie, {"usage": 0, "valid": True})
+            synced_states.append(
+                {"cookie": cookie, "usage": old_state["usage"], "valid": old_state["valid"]}
+            )
 
         self._cookie_states = synced_states
         logger.debug(
@@ -105,6 +108,7 @@ class DoubaoCookieManager:
             state
             for state in self._cookie_states
             if state["usage"] < COOKIE_DAILY_LIMIT
+            and state.get("valid", True)
         ]
 
         if not available_cookies:
@@ -132,6 +136,17 @@ class DoubaoCookieManager:
                 await self._save_states()
                 break
 
+    async def mark_cookie_invalid(self, cookie: str):
+        """标记一个Cookie为失效。"""
+        for state in self._cookie_states:
+            if state["cookie"] == cookie:
+                state["valid"] = False
+                logger.warning(
+                    f"🚫 Cookie ...{cookie[-20:]} 已被标记为失效，将不再使用。"
+                )
+                await self._save_states()
+                break
+
     def get_available_cookie_count(self) -> int:
         """获取当前可用cookie数量。"""
         return len(
@@ -139,6 +154,7 @@ class DoubaoCookieManager:
                 state
                 for state in self._cookie_states
                 if state["usage"] < COOKIE_DAILY_LIMIT
+                and state.get("valid", True)
             ]
         )
 
