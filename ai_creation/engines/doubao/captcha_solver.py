@@ -4,12 +4,13 @@ import random
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeoutError
 from pydantic import BaseModel, Field
 
-from zhenxun.services.llm import create_multimodal_message, generate_structured
+from zhenxun.services.ai.llm.api import generate_structured
+from zhenxun.services.ai.core.messages import LLMMessage, TextPart, ImagePart
 from zhenxun.services.log import logger
 
 from ...config import base_config
 from .exceptions import ImageGenerationError
-from .generator import HumanActionUtils # 引用新添加的工具类
+from .generator import HumanActionUtils
 
 
 class CaptchaSolution(BaseModel):
@@ -87,6 +88,7 @@ async def _solve_drag_captcha_attempt(page: Page) -> bool:
     """
     if not page:
         return False
+    captcha_frame = None
     try:
         logger.debug("等待验证码提示框出现")
         captcha_container = page.locator("#captcha_container")
@@ -108,9 +110,12 @@ async def _solve_drag_captcha_attempt(page: Page) -> bool:
         logger.debug(f"   - 验证码提示: '{captcha_prompt}'")
         logger.debug(f"   - 已截取验证码区域图片 ({len(screenshot_bytes)} bytes)")
 
-        message = create_multimodal_message(
-            text=f"问题是：'{captcha_prompt}'", images=[screenshot_bytes]
-        )
+        message = [
+            LLMMessage.user([
+                TextPart(text=f"问题是：'{captcha_prompt}'"),
+                ImagePart(raw=screenshot_bytes)
+            ])
+        ]
         logger.debug("   - 正在调用Vision LLM分析验证码...")
         solution = await generate_structured(
             message,
@@ -142,13 +147,11 @@ async def _solve_drag_captcha_attempt(page: Page) -> bool:
                 if source_box and target_box:
                     logger.debug(f"   - 正在模拟拖动第 {index} 张图片...")
                     
-                    # 计算起点和终点中心
                     start_x = source_box["x"] + source_box["width"] / 2
                     start_y = source_box["y"] + source_box["height"] / 2
                     end_x = target_box["x"] + target_box["width"] / 2
                     end_y = target_box["y"] + target_box["height"] / 2
 
-                    # 1. 移动到源图片
                     await page.mouse.move(
                         start_x + random.uniform(-5, 5),
                         start_y + random.uniform(-5, 5),
@@ -157,11 +160,10 @@ async def _solve_drag_captcha_attempt(page: Page) -> bool:
                     await page.mouse.down()
                     await asyncio.sleep(random.uniform(0.1, 0.3))
                     
-                    # 2. 拖拽到目标区域（增加 steps 以模拟移动过程，而不是瞬移）
                     await page.mouse.move(
-                        end_x + random.uniform(-10, 10), # 终点增加随机抖动
+                        end_x + random.uniform(-10, 10),
                         end_y + random.uniform(-10, 10),
-                        steps=random.randint(30, 60),    # 拖拽过程慢一点
+                        steps=random.randint(30, 60),
                     )
                     await page.mouse.up()
                     await asyncio.sleep(random.uniform(0.5, 1.0))
@@ -183,10 +185,11 @@ async def _solve_drag_captcha_attempt(page: Page) -> bool:
     except PlaywrightTimeoutError:
         logger.warning("   - 等待验证码元素超时或验证后弹窗未消失，可能失败。")
         try:
-            refresh_button = captcha_frame.locator(".vc-captcha-refresh")
-            if await refresh_button.is_visible():
-                await refresh_button.click()
-                logger.debug("   - 已尝试点击刷新按钮。")
+            if captcha_frame is not None:
+                refresh_button = captcha_frame.locator(".vc-captcha-refresh")
+                if await refresh_button.is_visible():
+                    await refresh_button.click()
+                    logger.debug("   - 已尝试点击刷新按钮。")
         except Exception as e:
             logger.warning(f"   - 刷新验证码失败: {e}")
         return False

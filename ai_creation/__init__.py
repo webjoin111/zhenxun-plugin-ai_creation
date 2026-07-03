@@ -88,7 +88,7 @@ draw [附带图片] -o on 换成赛博朋克风格
     supported_adapters={"~onebot.v11"},
     extra=PluginExtraData(
         author="webjoin111",
-        version="1.2.5",
+        version="1.2.7",
         configs=[
             RegisterConfig(
                 module="ai_creation",
@@ -312,9 +312,9 @@ driver = get_driver()
 @driver.on_startup
 async def _():
     logger.debug("AI Draw Plugin: 正在初始化...")
-    from .engines.doubao.queue_manager import draw_queue_manager
-    from .engines.doubao.cookie_manager import cookie_manager
     from . import templates
+    from .engines.doubao.cookie_manager import cookie_manager
+    from .engines.doubao.queue_manager import draw_queue_manager
 
     try:
         cooldown = base_config.get("browser_cooldown_seconds")

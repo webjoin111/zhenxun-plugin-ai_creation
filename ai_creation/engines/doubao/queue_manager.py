@@ -347,9 +347,10 @@ class DrawQueueManager:
             if not current_request:
                 return
 
+            from .cookie_manager import cookie_manager
+
             while True:
                 try:
-                    from .cookie_manager import cookie_manager
 
                     use_cookies = (
                         base_config.get("ENABLE_DOUBAO_COOKIES")

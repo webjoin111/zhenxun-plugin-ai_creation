@@ -9,7 +9,8 @@ from nonebot_plugin_waiter import waiter
 from pydantic import BaseModel
 
 from zhenxun import ui
-from zhenxun.services.llm import generate_structured, message_to_unimessage
+from zhenxun.services.ai.llm.api import generate_structured
+from zhenxun.services.ai.message_builder import MessageBuilder
 from zhenxun.services.log import logger
 from zhenxun.ui.models.core import TableData
 
@@ -119,7 +120,7 @@ async def dtemplate_superuser_handler(
         user_intent_message = UniMessage(main_args)
 
         if event.reply and event.reply.message:
-            reply_unimsg = message_to_unimessage(event.reply.message)
+            reply_unimsg = MessageBuilder.message_to_unimessage(event.reply.message)
             if reply_unimsg[UniImage]:
                 user_intent_message.extend(reply_unimsg[UniImage])  # type: ignore
 

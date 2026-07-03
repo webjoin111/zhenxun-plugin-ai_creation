@@ -1,6 +1,6 @@
 from typing import Any
 
-from zhenxun.services.llm import create_image
+from zhenxun.services.ai.llm.api import create_image
 from zhenxun.services.log import logger
 
 from ..config import base_config

@@ -14,20 +14,17 @@ from nonebot.adapters.onebot.v11 import (
 from nonebot.exception import FinishedException
 from nonebot_plugin_alconna import AlconnaMatcher, At, CommandResult, UniMessage
 from nonebot_plugin_alconna.uniseg import Image as UniImage
+from nonebot_plugin_alconna.uniseg import At
 from playwright.async_api import Error as PlaywrightError
 from pydantic import BaseModel, Field
 
 from zhenxun.services import avatar_service
-from zhenxun.services.llm import (
-    CommonOverrides,
-    LLMMessage,
-    generate,
-    message_to_unimessage,
-    unimsg_to_llm_parts,
-)
-from zhenxun.services.llm.config import LLMGenerationConfig
-from zhenxun.services.llm.config.generation import OutputConfig
-from zhenxun.services.llm.types import get_user_friendly_error_message
+from zhenxun.services.ai.llm.api import generate_structured
+from zhenxun.services.ai.core.messages import LLMMessage, ImagePart, TextPart
+from zhenxun.services.ai.core.options import GenerationConfig
+from zhenxun.services.ai.core.exceptions import get_user_friendly_error_message
+from zhenxun.services.ai.message_builder import MessageBuilder
+from zhenxun.services.ai.run.context import NoneBotDeps
 from zhenxun.services.log import logger
 from zhenxun.utils.http_utils import AsyncHttpx
 from zhenxun.utils.platform import PlatformUtils
@@ -38,6 +35,23 @@ from ..engines.doubao.exceptions import ImageGenerationError
 from ..engines import DrawEngine, get_engine
 from ..engines.llm_api import LlmApiEngine
 from ..templates import template_manager
+
+
+@MessageBuilder.register_segment_handler(At)
+async def _handle_ai_creation_at(seg: At) -> ImagePart | None:
+    deps = NoneBotDeps.get_current()
+    if not deps or not deps.bot:
+        return None
+
+    platform = PlatformUtils.get_platform(deps.bot)
+    avatar_path = await avatar_service.get_avatar_path(
+        platform, seg.target, force_refresh=True
+    )
+
+    if avatar_path and avatar_path.exists():
+        async with aiofiles.open(avatar_path, "rb") as f:
+            return ImagePart(raw=await f.read())
+    return None
 
 
 async def send_images_as_forward(
@@ -155,6 +169,14 @@ async def resolve_template_name_by_input(
     return user_input
 
 
+class PromptOptimizeResponse(BaseModel):
+    """用于接收结构化优化结果的 Pydantic 模型"""
+    success: bool
+    original_prompt: str
+    analysis: str
+    optimized_prompt: str
+
+
 async def _optimize_draw_prompt(
     user_message: UniMessage, user_id: str, template_prompt: str | None = None
 ) -> str:
@@ -171,14 +193,7 @@ async def _optimize_draw_prompt(
             f"绘图描述优化将使用模型: {base_config.get('auxiliary_llm_model')}"
         )
 
-        if "gemini" in base_config.get("auxiliary_llm_model", "").lower():
-            gen_config = CommonOverrides.gemini_json()
-        else:
-            gen_config = LLMGenerationConfig(
-                output=OutputConfig(response_format={"type": "json_object"})
-            )
-
-        content_parts = await unimsg_to_llm_parts(user_message)
+        content_parts = await MessageBuilder.unimsg_to_llm_parts(user_message)
         if not content_parts and not template_prompt:
             logger.warning("无法从用户消息中提取有效内容进行优化，将使用原始描述。")
             return original_prompt
@@ -193,7 +208,7 @@ async def _optimize_draw_prompt(
             for seg in user_message:
                 if not isinstance(seg, str):
                     fusion_message.append(seg)
-            final_content_parts = await unimsg_to_llm_parts(fusion_message)
+            final_content_parts = await MessageBuilder.unimsg_to_llm_parts(fusion_message)
         else:
             system_prompt = SYSTEM_PROMPT_OPTIMIZE
             final_content_parts = content_parts
@@ -203,26 +218,15 @@ async def _optimize_draw_prompt(
             LLMMessage.user(final_content_parts),
         ]
 
-        llm_response = await generate(
+        response = await generate_structured(
             messages,
-            model=base_config.get("auxiliary_llm_model"),
-            **gen_config.to_dict(),
+            response_model=PromptOptimizeResponse,
+            model=base_config.get("auxiliary_llm_model")
         )
 
-        response_text = llm_response.text
-
-        json_match = re.search(r"\{.*\}", response_text, re.DOTALL)
-        if not json_match:
-            logger.warning("描述优化LLM未返回有效的JSON结构，将使用原始描述。")
-            return original_prompt
-
-        parsed_json = json.loads(json_match.group())
-
-        if parsed_json.get("success") and (
-            optimized := parsed_json.get("optimized_prompt")
-        ):
-            logger.info(f"✅ 描述优化成功。优化后: '{optimized}'")
-            return optimized
+        if response.success and response.optimized_prompt:
+            logger.info(f"✅ 描述优化成功。优化后: '{response.optimized_prompt}'")
+            return response.optimized_prompt
         logger.warning("描述优化LLM返回内容不符合预期，将使用原始描述。")
         return original_prompt
 
@@ -289,53 +293,17 @@ class DrawingService:
         raw_result = result.result
 
         main_args = raw_result.main_args if raw_result and raw_result.main_args else {}
-        initial_segments = list(main_args.get("prompt", [])) + list(
-            main_args.get("$extra", [])
-        )
+        prompt_args = main_args.get("prompt", [])
+        if not isinstance(prompt_args, list):
+            prompt_args = [prompt_args]
 
-        final_segments: list[Any] = []
-        user_ids_to_fetch: set[str] = set()
-        image_bytes_list: list[bytes] = []
+        extra_args = main_args.get("$extra", [])
+        initial_segments = prompt_args + list(extra_args)
 
-        for seg in initial_segments:
-            if isinstance(seg, At):
-                user_ids_to_fetch.add(seg.target)
-            elif isinstance(seg, str):
-                matches = re.findall(r"@(\d{5,12})", seg)
-                if matches:
-                    user_ids_to_fetch.update(matches)
-                    cleaned_text = re.sub(r"@\d{5,12}", "", seg).strip()
-                    if cleaned_text:
-                        final_segments.append(cleaned_text)
-                else:
-                    final_segments.append(seg)
-            else:
-                final_segments.append(seg)
-
-        if user_ids_to_fetch:
-            logger.debug(f"检测到艾特 {len(user_ids_to_fetch)} 位用户，将获取头像...")
-            platform = PlatformUtils.get_platform(self.ctx.bot)
-            for uid in user_ids_to_fetch:
-                avatar_path = await avatar_service.get_avatar_path(
-                    platform, uid, force_refresh=True
-                )
-                if avatar_path and avatar_path.exists():
-                    async with aiofiles.open(avatar_path, "rb") as f:
-                        image_bytes_list.append(await f.read())
-
-        text_parts = [seg for seg in final_segments if isinstance(seg, str)]
-        other_parts = [seg for seg in final_segments if not isinstance(seg, str)]
-
-        reconstructed_text = " ".join(text_parts)
-
-        new_message_parts: list[Any] = []
-        if reconstructed_text:
-            new_message_parts.append(reconstructed_text)
-        new_message_parts.extend(other_parts)
-        user_intent_message = UniMessage(new_message_parts)
+        user_intent_message = UniMessage(initial_segments)
 
         if self.ctx.event.reply and self.ctx.event.reply.message:  # type: ignore
-            reply_unimsg = message_to_unimessage(self.ctx.event.reply.message)
+            reply_unimsg = MessageBuilder.message_to_unimessage(self.ctx.event.reply.message)
             if reply_unimsg[UniImage]:
                 for seg in reply_unimsg:
                     if isinstance(seg, UniImage):
@@ -345,27 +313,26 @@ class DrawingService:
                 user_intent_message = user_intent_message + reply_unimsg
                 logger.debug("已合并引用消息中的文本内容。")
 
-        if user_intent_message[UniImage]:
-            logger.debug(
-                f"检测到 {len(user_intent_message[UniImage])} 张图片输入，准备用于绘图..."
-            )
-            for image_seg in user_intent_message[UniImage]:
-                image_data = None
-                if image_seg.raw:
-                    image_data = image_seg.raw
-                elif image_seg.path:
-                    async with aiofiles.open(image_seg.path, "rb") as f:
-                        image_data = await f.read()
-                elif image_seg.url:
-                    image_data = await AsyncHttpx.get_content(image_seg.url)
-                if image_data:
-                    if isinstance(image_data, BytesIO):
-                        image_data = image_data.getvalue()
-                    if isinstance(image_data, bytes):
-                        image_bytes_list.append(image_data)
-
         self.ctx.initial_unimsg = UniMessage(initial_segments)
         self.ctx.user_intent_message = user_intent_message
+
+        llm_parts = await MessageBuilder.unimsg_to_llm_parts(user_intent_message)
+
+        image_bytes_list = []
+        text_parts = []
+
+        for part in llm_parts:
+            if part.type == "image":
+                if part.raw:
+                    image_bytes_list.append(part.raw)
+                elif part.path:
+                    async with aiofiles.open(part.path, "rb") as f:
+                        image_bytes_list.append(await f.read())
+            elif part.type == "text":
+                if part.text.strip():
+                    text_parts.append(part.text)
+
+        self.ctx.user_prompt = " ".join(text_parts).strip()
         self.ctx.image_bytes_list = image_bytes_list
 
     async def _resolve_prompt_and_engine(self):
@@ -373,7 +340,7 @@ class DrawingService:
         options = self.ctx.initial_options
         matcher = self.ctx.matcher
 
-        user_prompt = self.ctx.user_intent_message.extract_plain_text().strip()
+        user_prompt = self.ctx.user_prompt
         template_prompt: str | None = None
         initial_message_parts: list[str] = []
 
@@ -442,7 +409,6 @@ class DrawingService:
         engine = get_engine(engine_name)
 
         self.ctx.initial_message_parts = initial_message_parts
-        self.ctx.user_prompt = user_prompt
         self.ctx.template_prompt = template_prompt
         self.ctx.final_prompt = final_prompt
         self.ctx.engine_name = engine_name
@@ -513,11 +479,7 @@ class DrawingService:
         try:
             gen_config = None
             if self.ctx.image_size:
-                from zhenxun.services.llm.config.generation import GenConfigBuilder
-
-                builder = GenConfigBuilder()
-                builder.config_visual(resolution=self.ctx.image_size)
-                gen_config = builder.build()
+                gen_config = GenerationConfig.builder().with_image_generation_params(resolution=self.ctx.image_size).build()
 
             draw_result = await self.ctx.engine.draw(
                 self.ctx.final_prompt, self.ctx.image_bytes_list, config=gen_config

@@ -3,6 +3,7 @@ import base64
 from datetime import datetime
 import hashlib
 import json
+import re
 import random
 from typing import Any, cast
 
@@ -505,6 +506,35 @@ class DoubaoImageGenerator:
         except Exception as e:
             logger.warning(f"检查登录状态时发生意外错误: {e}")
 
+    async def _switch_to_seedream_5_lite(self):
+        """自动检测并切换至 Seedream 5.0 Lite 模型"""
+        if not self.page:
+            return
+
+        try:
+            logger.debug("检查并切换绘图模型至 Seedream 5.0 Lite...")
+
+            current_model_btn = self.page.locator("text=/Seedream \\d\\.\\d(?! Lite)/i").first
+
+            if await current_model_btn.is_visible(timeout=2000):
+                logger.debug("检测到当前模型不是 5.0 Lite，正在展开下拉菜单...")
+                await current_model_btn.click(force=True)
+                await asyncio.sleep(1.0)
+
+                target_item = self.page.locator('div[role="menuitem"]:has-text("Seedream 5.0 Lite")').first
+                if await target_item.is_visible(timeout=3000):
+                    await target_item.click(force=True)
+                    logger.info("✅ 已自动切换至模型: Seedream 5.0 Lite")
+                    await asyncio.sleep(0.5)
+                else:
+                    logger.warning("下拉菜单已打开，但未找到 5.0 Lite 选项，放弃切换。")
+                    await self.page.mouse.click(10, 10)
+            else:
+                logger.debug("当前无需切换模型（可能已是 5.0 Lite 或未找到下拉按钮）。")
+
+        except Exception as e:
+            logger.warning(f"尝试切换模型时发生非致命异常，将继续默认流程: {e}")
+
     async def _handle_captcha_if_present(self) -> bool:
         """
         检查页面是否存在验证码，如果存在且配置开启，则尝试解决。
@@ -543,16 +573,69 @@ class DoubaoImageGenerator:
         content_order: list[dict[str, Any]] = []
         image_data_map: dict[str, list[str]] = {}
         current_text_buffer: list[str] = []
+        intercepted_images_dict: dict[str, str] = {}
+
+        async def _telemetry_handler(request):
+            try:
+                if "mcs.doubao.com/list" in request.url and request.method == "POST":
+                    post_data = request.post_data
+                    if post_data and ("rd_flow_message_streaming_finished" in post_data or "message_total_answers_end" in post_data):
+                        generation_complete_event.set()
+            except Exception:
+                pass
+
+        async def _api_data_interceptor(response):
+            try:
+                url = response.url
+                if response.status != 200:
+                    return
+
+                if "rc_gen_image" in url and "http" in url:
+                    id_match = re.search(r'rc_gen_image/([^/~\.]+)', url)
+                    if id_match:
+                        img_id = id_match.group(1)
+                        is_large = "image_pre_watermark" in url
+                        if img_id not in intercepted_images_dict:
+                            intercepted_images_dict[img_id] = url
+                        else:
+                            if is_large and "downsize_watermark" in intercepted_images_dict[img_id]:
+                                intercepted_images_dict[img_id] = url
+
+                content_type = response.headers.get("content-type", "").lower()
+                if not ("application/json" in content_type or "text/event-stream" in content_type):
+                    return
+                
+                if "mcs.doubao.com" in url or "monitor_browser" in url or "notice/info" in url:
+                    return
+
+                try:
+                    body_bytes = await response.body()
+                    body_text = body_bytes.decode("utf-8", errors="ignore")
+                except Exception:
+                    return
+
+                matches = re.findall(r'(https?://[a-zA-Z0-9\-\.]+\.byteimg\.com[^\s"\'\\]+rc_gen_image/[^\s"\'\\]+)', body_text)
+                
+                for raw_url in matches:
+                    clean_url = raw_url.replace("\\/", "/").replace("\\u0026", "&")
+                    id_match = re.search(r'rc_gen_image/([^/~\.]+)', clean_url)
+                    if id_match:
+                        img_id = id_match.group(1)
+                        is_large = "image_pre_watermark" in clean_url
+                        if img_id not in intercepted_images_dict:
+                            intercepted_images_dict[img_id] = clean_url
+                        else:
+                            if is_large and "downsize_watermark" in intercepted_images_dict[img_id]:
+                                intercepted_images_dict[img_id] = clean_url
+            except Exception:
+                pass
 
         async def _local_sse_handler(response):
             try:
-                if (
-                    "completion" not in response.url
-                    or response.status != 200
-                    or "text/event-stream"
-                    not in response.headers.get("content-type", "")
-                ):
+                content_type = response.headers.get("content-type", "").lower()
+                if response.status != 200 or "text/event-stream" not in content_type:
                     return
+                    
 
                 try:
                     body_bytes = await response.body()  # type: ignore
@@ -593,63 +676,13 @@ class DoubaoImageGenerator:
                                 repaired_text.replace("\\n", "\n")
                             )
 
-                        creations = content_json.get("creations")
-                        if creations and isinstance(creations, list):
-                            if current_text_buffer:
-                                content_order.append(
-                                    {
-                                        "type": "text",
-                                        "content": "".join(current_text_buffer),
-                                    }
-                                )
-                                current_text_buffer.clear()
-
-                            message_id = message_data.get("id")
-                            is_placeholder = any(
-                                c.get("image", {}).get("status") == 1 for c in creations
-                            )
-
-                            if is_placeholder and not any(
-                                block.get("id") == message_id for block in content_order
-                            ):
-                                content_order.append(
-                                    {"type": "image", "id": message_id}
-                                )
-                            else:
-                                urls = []
-                                for creation in creations:
-                                    image_info = creation.get("image", {})
-                                    if raw_url_info := image_info.get("image_ori_raw"):
-                                        logger.debug(
-                                            f"  -> 发现 image_ori_raw 链接: {raw_url_info.get('url')}"
-                                        )
-                                    if ori_url_info := image_info.get("image_ori"):
-                                        logger.debug(
-                                            f"  -> 发现 image_ori 链接: {ori_url_info.get('url')}"
-                                        )
-
-                                    url = None
-                                    if raw_url := image_info.get(
-                                        "image_ori_raw", {}
-                                    ).get("url"):
-                                        if "_pre_" not in raw_url:
-                                            url = raw_url
-                                    if not url and (
-                                        ori_url := image_info.get("image_ori", {}).get(
-                                            "url"
-                                        )
-                                    ):
-                                        if "_pre_" not in ori_url:
-                                            url = ori_url
-                                    if url:
-                                        urls.append(url)
-                                if message_id and urls:
-                                    image_data_map[message_id] = urls
 
                     except (json.JSONDecodeError, KeyError) as e:
                         logger.debug(f"跳过无法解析的SSE片段: {e}")
                     except Exception as inner_exc:
                         logger.debug(f"SSE事件处理出现内部错误: {inner_exc}")
+
+                generation_complete_event.set()
             except Exception as exc:
                 logger.warning(f"SSE拦截器处理响应失败: {exc}")
 
@@ -659,6 +692,8 @@ class DoubaoImageGenerator:
 
         if self.page:
             self.page.on("response", _local_sse_handler)
+            self.page.on("response", _api_data_interceptor)
+            self.page.on("request", _telemetry_handler)
             self.page.on("close", _on_page_close)
 
         try:
@@ -668,24 +703,41 @@ class DoubaoImageGenerator:
             if check_login:
                 await self.check_login_status()
 
-            if image_paths:
-                logger.debug(f"检测到 {len(image_paths)} 张图片输入，开始上传...")
-                if not await self._upload_images(image_paths):
-                    logger.warning("图片上传失败，继续使用纯文本模式")
-                else:
-                    logger.debug("图片上传成功，等待图片处理...")
-                    await asyncio.sleep(5)
+            await self._switch_to_seedream_5_lite()
 
-            if not await self._input_prompt(prompt):
-                raise ImageGenerationError("输入提示词失败")
+            max_input_attempts = 3
+            for attempt in range(max_input_attempts):
+                logger.debug(f"正在进行第 {attempt + 1} 次内容输入尝试...")
 
-            if not await self._submit_generation():
-                raise ImageGenerationError("提交生成请求失败")
+                if image_paths:
+                    logger.debug(f"检测到 {len(image_paths)} 张图片输入，开始上传...")
+                    if not await self._upload_images(image_paths):
+                        logger.warning("图片上传失败，继续使用纯文本模式")
+                    else:
+                        logger.debug("图片上传成功，等待图片处理...")
+                        await asyncio.sleep(5)
 
-            captcha_was_handled = await self._handle_captcha_if_present()
-            if captcha_was_handled:
-                logger.debug("验证码已处理，重置SSE流结束信号，等待新的生成流。")
-                generation_complete_event.clear()
+                if not await self._input_prompt(prompt):
+                    raise ImageGenerationError("输入提示词失败")
+
+                if not await self._submit_generation():
+                    raise ImageGenerationError("提交生成请求失败")
+
+                captcha_was_handled = await self._handle_captcha_if_present()
+
+                if captcha_was_handled:
+                    logger.info(
+                        "检测到并解决了验证码，由于表单状态可能已重置，准备重新发送内容..."
+                    )
+                    generation_complete_event.clear()
+                    await asyncio.sleep(2)
+                    continue
+
+                break
+            else:
+                raise ImageGenerationError(
+                    f"在 {max_input_attempts} 次尝试后仍因验证码或输入问题无法提交。"
+                )
 
             signal_timeout = int(base_config.get("doubao_wait_signal_timeout", 120))
 
@@ -745,18 +797,19 @@ class DoubaoImageGenerator:
             for block in content_order:
                 if block["type"] == "text":
                     structured_result.append(block)
-                elif block["type"] == "image":
-                    image_urls = image_data_map.get(block["id"], [])
-                    if image_urls:
-                        structured_result.append(
-                            {
-                                "type": "image",
-                                "content": [
-                                    {"url": url, "index": i}
-                                    for i, url in enumerate(image_urls)
-                                ],
-                            }
-                        )
+
+            intercepted_image_urls = list(intercepted_images_dict.values())
+            if intercepted_image_urls:
+                logger.info(f"✨ 成功提取到 {len(intercepted_image_urls)} 张原生高清大图链接")
+                structured_result.append(
+                    {
+                        "type": "image",
+                        "content": [
+                            {"url": url, "index": i}
+                            for i, url in enumerate(intercepted_image_urls)
+                        ],
+                    }
+                )
 
             return structured_result
 
@@ -768,6 +821,8 @@ class DoubaoImageGenerator:
         finally:
             if self.page:
                 self.page.remove_listener("response", _local_sse_handler)
+                self.page.remove_listener("response", _api_data_interceptor)
+                self.page.remove_listener("request", _telemetry_handler)
                 try:
                     self.page.remove_listener("close", _on_page_close)
                 except Exception:
@@ -789,9 +844,7 @@ class DoubaoImageGenerator:
             {"url": info["url"], "index": info["index"]} for info in image_infos
         ]
 
-        logger.info(f"开始批量下载 {len(urls_with_index)} 张图片...")
-        for item in urls_with_index:
-            logger.debug(f"  -> 准备下载图片: {item['url']}")
+        logger.debug(f"开始批量下载 {len(urls_with_index)} 张图片...")
 
         try:
             download_results = await self.page.evaluate(
